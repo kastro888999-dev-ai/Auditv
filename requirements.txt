@@ -1,0 +1,7 @@
+# Video-to-Markdown pipeline requirements
+# Install inside the project venv:
+#   ./venv/bin/pip install -r requirements.txt
+
+openai-whisper>=20250625
+torch>=2.6
+yt-dlp>=2025.1.1

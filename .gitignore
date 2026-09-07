@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv
+venv/
+
+# Test / generated outputs
+test/
+frames_*/
+*_analysis.md
+
+# OS
+.DS_Store
