@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AuditV — Análisis de video y apuntes
+Comment=Analiza videos/URLs y toma apuntes de reuniones en vivo
+Exec=/home/kox/ProgramacionIA/AuditV/start_gui.sh
+Icon=applications-multimedia
+Terminal=false
+Categories=Office;AudioVideo;Education;
+StartupNotify=false

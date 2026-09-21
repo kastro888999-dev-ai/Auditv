@@ -10,6 +10,8 @@ venv/
 test/
 frames_*/
 *_analysis.md
+descargas/
+informes/
 
 # OS
 .DS_Store
