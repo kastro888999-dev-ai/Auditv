@@ -234,8 +234,11 @@ En portátiles con refrigeración justa (p. ej. GTX 1060 Mobile) el análisis
 LLM de Ollama sobre la GPU puede disparar la temperatura y **apagar el equipo
 a mitad de la ejecución**. Para evitarlo la herramienta:
 
-- Monitorea la temperatura de la GPU (`nvidia-smi`) y **aborta de forma
-  preventiva** desde 92°C (ajustable con `AUDITV_GPU_TEMP_ABORT`).
+- Monitorea la temperatura de la GPU (`nvidia-smi`): avisa desde 80°C
+  (ajustable con `AUDITV_GPU_TEMP_WARN`). Si alcanza 92°C
+  (`AUDITV_GPU_TEMP_ABORT`) durante una consulta LLM, **esa consulta y las
+  siguientes se reintentan en CPU** en vez de abortar, para que ningún bache
+  se quede sin resumen/conclusiones.
 - Guarda la transcripción (`_transcripcion.txt`) y un **informe parcial** con
   transcripción + frames ANTES de empezar el análisis con Ollama, para no
   perder progreso si el equipo se apaga.

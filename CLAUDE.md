@@ -136,8 +136,11 @@ LLM de Ollama puede sobrecalentar la GPU y **apagar el equipo a mitad de la
 ejecución**. La herramienta incluye protecciones para que no ocurra:
 
 - Monitorea la temperatura de la GPU (nvidia-smi): avisa desde 80°C. Desde
-  92°C **cancela el análisis LLM de forma suave** (sin matar el proceso), de
-  modo que el informe se genera igualmente con lo que sí se pudo analizar.
+  92°C si se alcanza durante una consulta LLM, **esa misma consulta se
+  reintenta en CPU** (sin matar el proceso): así el bache en curso y los
+  siguientes se resuelven igualmente (en CPU mientras la tarjeta no baje),
+  de modo que NINGÚN bache se queda sin resumen/conclusiones. Solo se usa la
+  GPU cuando la temperatura lo permite.
 - Escribe la transcripción y un **informe parcial** (`_transcripcion.txt` +
   `.md` con transcripción y frames) ANTES de empezar el análisis con Ollama,
   así nunca se pierde el progreso si el equipo se apaga.

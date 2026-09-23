@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import warnings
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,8 @@ ANALYSIS_PART_CHARS = int(os.environ.get("AUDITV_ANALYZE_PART_CHARS", "6000"))
 # por temperatura en portátiles con refrigeración justa). Pon 1/-1 para que
 # Ollama use la GPU si tu equipo lo aguanta.
 OLLAMA_NUM_GPU = os.environ.get("OLLAMA_NUM_GPU", "0")
+# Índice de la GPU que debe usar el LLM (main_gpu). None = auto/la de Ollama.
+OLLAMA_GPU_INDEX = os.environ.get("OLLAMA_GPU_INDEX")
 OLLAMA_NUM_THREADS = os.environ.get("OLLAMA_NUM_THREADS")
 # auto|cpu|cuda: forzar Whisper a CPU evita picos de carga en la GPU.
 DEVICE_HINT = os.environ.get("AUDITV_DEVICE", "auto")
@@ -272,14 +275,27 @@ def transcribe_audio(audio_path: str, model_size: str, device: str) -> dict:
 
     log(f"Loading Whisper model '{model_size}' on {device}...")
     model = whisper.load_model(model_size, device=device)
-    log("Transcribing...")
+    if device == "cpu":
+        log(
+            "Transcribiendo en CPU (la GPU no es compatible con este PyTorch "
+            "o elegiste --device cpu). EL warning 'Performing inference on CPU "
+            "when CUDA is available' de Whisper es genérico y se ignora.",
+            "DEVICE",
+        )
+    else:
+        log("Transcribing...")
     monitor = None
     if device == "cuda":
         check_gpu_health("transcripción")
         monitor = _GpuMonitor("transcripción")
         monitor.start()
     try:
-        result = model.transcribe(audio_path, fp16=(device == "cuda"))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Performing inference on CPU when CUDA is available",
+            )
+            result = model.transcribe(audio_path, fp16=(device == "cuda"))
     finally:
         if monitor is not None:
             monitor.stop()
@@ -323,38 +339,81 @@ def extract_frames(video_path: str, output_dir: str, interval_sec: float) -> lis
 # ---------------------------------------------------------------------------
 # Ollama integration (summary + ideas extraction)
 # ---------------------------------------------------------------------------
-def _ollama_generate(prompt: str, model: str, system: str = "") -> str:
-    """Send a prompt to a local Ollama server and return the raw text output."""
-    # Si la GPU ya está crítica, ni empezar: se aborta el análisis suavemente
-    # y el informe se escribe igualmente.
-    temp = gpu_temperature()
-    if temp is not None and temp >= GPU_TEMP_ABORT and _thermal["event"].is_set():
-        raise ThermalAbort(temp)
-    if temp is not None and temp >= GPU_TEMP_ABORT:
+def _ollama_generate(prompt: str, model: str, system: str = "", label: str = "") -> str:
+    """Send a prompt to a local Ollama server and return the raw text output.
+
+    Usa la GPU (OLLAMA_NUM_GPU != 0) salvo que la temperatura la desaconseje:
+    si la GPU ya está crítica o se calienta durante la consulta, ESA misma
+    consulta se reintenta en CPU (num_gpu=0) para que ningún bache se pierda
+    y el equipo no se apague. Los baches siguientes siguen en CPU mientras
+    la tarjeta no se enfríe.
+    """
+    use_gpu = int(OLLAMA_NUM_GPU) != 0
+    if use_gpu:
+        temp = gpu_temperature()
+        if temp is not None and temp >= GPU_TEMP_ABORT:
+            log(
+                f"GPU a {temp:.0f}°C (límite {GPU_TEMP_ABORT}°C): la GPU está "
+                "muy caliente; esta consulta se ejecuta en CPU para no perder "
+                "el bache ni apagar el equipo.",
+                "WARN",
+            )
+            use_gpu = False
+        elif temp is not None and temp >= GPU_TEMP_WARN:
+            log(
+                f"GPU a {temp:.0f}°C antes de '{label or 'análisis'}': riesgo alto "
+                "de apagado. Si la temperatura sigue subiendo, se continúa en "
+                "CPU sin perder esta parte.",
+                "WARN",
+            )
+    try:
+        return _ollama_generate_once(prompt, model, system, label, use_gpu)
+    except ThermalAbort:
+        if not use_gpu:
+            raise
+        _thermal["event"].clear()
         log(
-            f"GPU ya está a {temp:.0f}°C (límite {GPU_TEMP_ABORT}°C): se "
-            "cancela el análisis LLM para proteger el hardware.",
-            "ERROR",
+            f"GPU en temperatura crítica durante '{label or 'análisis'}': se "
+            "reintenta ESTA misma consulta en CPU para conservar el resumen/"
+            "conclusiones de esta parte (la GPU queda libre para enfriarse).",
+            "WARN",
         )
-        raise ThermalAbort(temp)
-    if _thermal["event"].is_set():
+        return _ollama_generate_once(prompt, model, system, label, use_gpu=False)
+
+
+def _ollama_generate_once(
+    prompt: str, model: str, system: str, label: str, use_gpu: bool
+) -> str:
+    """Envía una consulta a Ollama (con o sin GPU). Puede lanzar ThermalAbort."""
+    if _thermal["event"].is_set() and use_gpu:
         raise ThermalAbort(GPU_TEMP_ABORT)
 
-    options = {"num_ctx": OLLAMA_NUM_CTX, "num_gpu": int(OLLAMA_NUM_GPU)}
+    options = {
+        "num_ctx": OLLAMA_NUM_CTX,
+        "num_gpu": int(OLLAMA_NUM_GPU) if use_gpu else 0,
+    }
+    if OLLAMA_GPU_INDEX not in (None, "", "auto"):
+        try:
+            options["main_gpu"] = int(OLLAMA_GPU_INDEX)
+        except ValueError:
+            pass
     if OLLAMA_NUM_THREADS is not None:
         options["num_thread"] = int(OLLAMA_NUM_THREADS)
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "options": options,
     }
     if system:
         payload["system"] = system
 
-    check_gpu_health("análisis LLM (Ollama)")
-    monitor = _GpuMonitor("análisis LLM (Ollama)")
-    monitor.start()
+    monitor = None
+    if use_gpu:
+        monitor = _GpuMonitor("análisis LLM (Ollama)")
+        monitor.start()
+    started = time.time()
     try:
         req = urllib.request.Request(
             f"{OLLAMA_URL}/api/generate",
@@ -364,14 +423,19 @@ def _ollama_generate(prompt: str, model: str, system: str = "") -> str:
         )
         _open_resp["resp"] = None
         stop_beat = threading.Event()
+        gpu_mode = "CPU" if not use_gpu else f"GPU{'' if OLLAMA_GPU_INDEX is None else ' ' + OLLAMA_GPU_INDEX}"
+        log(f"LLM [{model}] {label or 'análisis'}: enviando consulta… ({gpu_mode})", "INFO")
 
         def _heartbeat() -> None:
             # Con Ollama en CPU el análisis tarda; avisa cada 20 s de que sigue.
-            started = time.time()
+            phase = "leyendo/analizando la transcripción"
             while not stop_beat.wait(20):
+                elapsed = int(time.time() - started)
+                if elapsed >= 40:
+                    phase = f"generando el {label or 'análisis'}…"
                 log(
-                    f"El análisis LLM ({model}) sigue trabajando... "
-                    f"{int(time.time() - started)} s",
+                    f"LLM [{model}] {label or 'análisis'}: {phase} ({elapsed} s). "
+                    f"Esperando su respuesta…",
                     "INFO",
                 )
 
@@ -382,21 +446,27 @@ def _ollama_generate(prompt: str, model: str, system: str = "") -> str:
                 _open_resp["resp"] = resp
                 data = json.loads(resp.read().decode("utf-8"))
                 _open_resp["resp"] = None
-                if _thermal["event"].is_set():
+                if _thermal["event"].is_set() and use_gpu:
                     raise ThermalAbort(GPU_TEMP_ABORT)
                 return data.get("response", "").strip()
         except ThermalAbort:
             log("Análisis LLM cancelado por temperatura crítica.", "ERROR")
             raise
         except Exception as exc:
-            log(f"Ollama request failed: {exc}", "ERROR")
+            log(f"LLM [{model}] {label or 'análisis'}: falló la consulta: {exc}", "ERROR")
             raise
         finally:
             stop_beat.set()
     finally:
         _open_resp["resp"] = None
-        monitor.stop()
-        monitor.join(timeout=GPU_TEMP_CHECK_INTERVAL + 1)
+        if monitor is not None:
+            monitor.stop()
+            monitor.join(timeout=GPU_TEMP_CHECK_INTERVAL + 1)
+        log(
+            f"LLM [{model}] {label or 'análisis'}: respuesta recibida "
+            f"en {int(time.time() - started)} s.",
+            "INFO",
+        )
 
 
 def _extract_json(text: str) -> dict:
@@ -510,7 +580,9 @@ def analyze_with_ollama(
     )
 
     log(f"Asking Ollama model '{model}' for analysis...")
-    result = _extract_json(_ollama_generate(prompt, model, system))
+    result = _extract_json(_ollama_generate(
+        prompt, model, system, label="análisis (resumen/ideas/conclusiones)"
+    ))
     if "resumen" in result or "ideas" in result or "conclusiones" in result:
         return result
 
@@ -522,7 +594,9 @@ def analyze_with_ollama(
         + prompt
     )
     log("Análisis LLM sin JSON válido; reintentando con formato estricto...", "WARN")
-    result2 = _extract_json(_ollama_generate(strict, model, system))
+    result2 = _extract_json(_ollama_generate(
+        strict, model, system, label="reintento (JSON estricto)"
+    ))
     for key, val in (result2 or {}).items():
         if val:
             result.setdefault(key, val)
@@ -531,11 +605,44 @@ def analyze_with_ollama(
     return result
 
 
-def merge_analyses(analyses: list) -> dict:
+def _merge_resumenes_with_llm(analyses: list, model: str) -> str:
+    """Una pasada extra del LLM que fusiona los resúmenes de todas las partes
+    en un único resumen ejecutivo. Devuelve "" si falla (se conserva el de partes)."""
+    system = (
+        "You are an expert meeting/video analyst. You receive the partial "
+        "summaries of one meeting and must merge them into a single executive "
+        "summary. Always answer in Spanish using ONLY valid JSON, no extra text."
+    )
+    partes = []
+    for i, a in enumerate(analyses, 1):
+        r = str(a.get("resumen") or "")
+        cs = "; ".join(str(c) for c in (a.get("conclusiones") or [])[:3])
+        if r or cs:
+            partes.append(f"Parte {i}: {r}{(' | Conclusiones: ' + cs) if cs else ''}")
+    prompt = (
+        "Fusiona los siguientes resúmenes parciales de una misma reunión en "
+        "UN único resumen ejecutivo en español, de 2 a 4 oraciones, coherente "
+        "y sin mencionar 'parte 1', 'parte 2', etc.\n"
+        "Responde ÚNICAMENTE con JSON: {\"resumen\": \"texto\"}\n\n"
+        f"RESÚMENES PARCIALES:\n" + "\n".join(partes)
+    )
+    try:
+        result = _extract_json(_ollama_generate(
+            prompt, model, system, label="fusión del resumen ejecutivo"
+        ))
+        return str(result.get("resumen", "")).strip()
+    except Exception as exc:
+        log(f"Fusión de resúmenes falló: {exc}", "WARN")
+        return ""
+
+
+def merge_analyses(analyses: list, model: str = None) -> dict:
     """Fusiona el análisis de varias partes en un solo dict (sin re-analizar).
 
     Junta las listas de ideas/discusiones/conceptos/conclusiones eliminando
-    duplicados y construye el resumen etiquetando cada parte.
+    duplicados. El resumen: si hay varias partes y se puede, se hace una pasada
+    extra del LLM para obtener UN resumen ejecutivo único (con 'model'); si no,
+    se etiqueta cada parte.
     """
     if not analyses:
         return {}
@@ -546,13 +653,17 @@ def merge_analyses(analyses: list) -> dict:
         if len(resumenes) == 1:
             result["resumen"] = str(resumenes[0])
         else:
-            partes = "\n\n".join(
-                f"**Resumen de la parte {i}:** {r}" for i, r in enumerate(resumenes, 1)
-            )
-            result["resumen"] = (
-                "Resumen por partes de la sesión (el análisis cubre el texto completo):\n\n"
-                + partes
-            )
+            merged = _merge_resumenes_with_llm(analyses, model) if model else ""
+            if merged:
+                result["resumen"] = merged
+            else:
+                partes = "\n\n".join(
+                    f"**Resumen de la parte {i}:** {r}" for i, r in enumerate(resumenes, 1)
+                )
+                result["resumen"] = (
+                    "Resumen por partes de la sesión (el análisis cubre el texto completo):\n\n"
+                    + partes
+                )
 
     def _dedupe(items):
         out, seen = [], set()
@@ -591,13 +702,28 @@ def _time_at_char(transcript_dict: dict, idx: int) -> float:
     return float(segs[-1].get("start", 0)) if segs else 0.0
 
 
-def analyze_transcript_in_parts(transcript_or_text, model: str, include_timestamps: bool = True):
+def analyze_transcript_in_parts(
+    transcript_or_text,
+    model: str,
+    include_timestamps: bool = True,
+    out_md: str = None,
+    video_path: str = None,
+    part_chars: int = ANALYSIS_PART_CHARS,
+    with_details: bool = False,
+    use_llm: bool = True,
+):
     """Analiza la transcripción completa dividiéndola en partes y fusionando.
 
     Flujo unificado (video y apuntes): si el texto es largo se parte en
     trozos de ANALYSIS_PART_CHARS, cada trozo se analiza por separado y los
     resultados se fusionan. Para videos, los timestamps de cada parte se
     desplazan al segundo real del video.
+
+    Si se pasa 'out_md' (y el texto es largo), además guarda junto al informe
+    un .txt y un .md por cada parte (igual para video y apuntes).
+
+    Con 'with_details=True' devuelve (analisis, partes, analisis_por_parte)
+    para que el llamador pueda ensamblar el informe completo fusionado.
     """
     if isinstance(transcript_or_text, dict):
         text = transcript_or_text.get("text") or ""
@@ -610,18 +736,27 @@ def analyze_transcript_in_parts(transcript_or_text, model: str, include_timestam
     if not text.strip():
         return {"resumen": "*(Sin transcripción disponible)*", "ideas": [], "discusiones": [], "conceptos": [], "conclusiones": []}
 
-    parts = split_text(text, ANALYSIS_PART_CHARS)
+    parts = split_text(text, part_chars)
     if not parts:
         parts = [text]
     if len(parts) == 1:
-        return analyze_with_ollama(text, model, include_timestamps)
+        analysis = analyze_with_ollama(text, model, include_timestamps)
+        if with_details:
+            return analysis, parts, [analysis]
+        return analysis
 
-    log(f"Transcripción larga ({len(text)} chars): análisis en {len(parts)} partes de ~{ANALYSIS_PART_CHARS}.")
+    log(f"Transcripción larga ({len(text)} chars): análisis en {len(parts)} partes de ~{part_chars}.")
     analyses = []
     consumed = 0
+    n_total = len(parts)
     for i, part in enumerate(parts, 1):
         part_analysis = {"resumen": "*(Sin contenido en esta parte)*"}
-        if time_at is not None and part:
+        if not use_llm:
+            part_analysis = {
+                "resumen": "*(Análisis LLM omitido)*",
+                "ideas": [], "discusiones": [], "conceptos": [], "conclusiones": [],
+            }
+        elif time_at is not None and part:
             time_fn, transcript_dict = time_at
             base_sec = time_fn(transcript_dict, consumed + 1)
             consumed += len(part) + 1
@@ -638,7 +773,33 @@ def analyze_transcript_in_parts(transcript_or_text, model: str, include_timestam
             except Exception as exc:
                 log(f"Análisis de la parte {i} falló: {exc}", "WARN")
         analyses.append(part_analysis)
-    return merge_analyses(analyses)
+        if out_md is not None:
+            _save_part_files(part, part_analysis, out_md, video_path, i, n_total, model)
+
+    merged = merge_analyses(analyses, model)
+    if with_details:
+        return merged, parts, analyses
+    return merged
+
+
+def _save_part_files(
+    part_text, analysis, out_md, source_path, part_idx, n_total, ollama_model=None
+):
+    """Guarda el .txt (bache de ~6000 chars) y su .md en la subcarpeta
+    '<informe>_partes' junto a la salida (igual para video y apuntes)."""
+    base = Path(out_md)
+    parts_dir = base.parent / f"{base.stem}_partes"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    txt = parts_dir / f"{base.stem}_parte{part_idx}.txt"
+    txt.write_text(_format_running_text(part_text), encoding="utf-8")
+    md = parts_dir / f"{base.stem}_parte{part_idx}.md"
+    build_part_markdown(
+        source_path, part_idx, n_total, part_text, analysis, str(md), ollama_model
+    )
+    log(
+        f"Bache {part_idx}: {txt.name} -> {md.name} (en la carpeta {parts_dir.name}/)",
+        "AUDITV",
+    )
 
 
 
@@ -723,7 +884,7 @@ def build_markdown(
 
     lines.append("## 📌 Resumen ejecutivo")
     lines.append("")
-    lines.append(analysis.get("resumen", "*(Sin resumen disponible)*"))
+    lines.append(_format_running_text(analysis.get("resumen", "*(Sin resumen disponible)*")))
     lines.append("")
 
     lines.append("## 🧠 Ideas principales")
@@ -788,6 +949,106 @@ def build_markdown(
     log(f"Markdown written -> {output_md}")
 
 
+def build_part_markdown(
+    source_path: str,
+    part_idx: int,
+    part_total: int,
+    part_text: str,
+    analysis: dict,
+    output_md: str,
+    ollama_model: str = None,
+) -> None:
+    """Write a self-contained .md for one analysed part.
+
+    Shared by the video flow (per-part files next to the report) and the
+    Apuntes flow (single report or per-part files), so both behave the same:
+    resumen, ideas, discusiones, conceptos, conclusiones and the part text.
+    With part_total > 1 the titles say "… de esta parte"; otherwise it is a
+    standalone notes report.
+    """
+    name = Path(source_path).name if source_path else "(fuente)"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    is_part = bool(part_total and part_total > 1)
+    lines = []
+    if is_part:
+        lines.append(f"# 🎬 {name} — Parte {part_idx}")
+    else:
+        lines.append(f"# 📝 Apuntes: {name}")
+    lines.append("")
+    lines.append(f"- **Generado:** {now}")
+    if ollama_model:
+        lines.append(f"- **Modelo LLM:** {ollama_model}")
+    lines.append("")
+
+    if analysis.get("titulo"):
+        lines.append(f"## 🏷️ {analysis['titulo']}")
+        lines.append("")
+
+    sufx = " de esta parte" if is_part else ""
+    lines.append(f"## 📌 Resumen{sufx}")
+    lines.append("")
+    lines.append(_format_running_text(analysis.get("resumen", "*(Sin resumen disponible)*")))
+    lines.append("")
+
+    lines.append(f"## 🧠 Ideas principales{sufx}")
+    lines.append("")
+    ideas = analysis.get("ideas", [])
+    if ideas:
+        for i, idea in enumerate(ideas, 1):
+            ts = idea.get("timestamp") if isinstance(idea, dict) else None
+            ts_str = f" `[{fmt_ts(float(ts))}]`" if ts else ""
+            titulo = idea.get("titulo", "Sin título") if isinstance(idea, dict) else str(idea)
+            lines.append(f"### {i}. {titulo}{ts_str}")
+            lines.append("")
+            desc = idea.get("descripcion", "") if isinstance(idea, dict) else ""
+            if desc:
+                lines.append(desc)
+                lines.append("")
+    else:
+        lines.append("*(No se detectaron ideas principales.)*")
+        lines.append("")
+
+    lines.append(f"## 💬 Discusiones / Puntos debatidos{sufx}")
+    lines.append("")
+    discussions = analysis.get("discusiones", [])
+    lines.append(("- " + "\n- ".join(str(d) for d in discussions)) if discussions
+                 else "*(Sin discusiones destacadas)*")
+    lines.append("")
+
+    lines.append(f"## 🔑 Conceptos clave{sufx}")
+    lines.append("")
+    concepts = analysis.get("conceptos", [])
+    lines.append(("- " + "\n- ".join(str(c) for c in concepts)) if concepts
+                 else "*(Sin conceptos destacados)*")
+    lines.append("")
+
+    lines.append(f"## ✅ Conclusiones{sufx}")
+    lines.append("")
+    conclusions = analysis.get("conclusiones", [])
+    lines.append(("- " + "\n- ".join(str(c) for c in conclusions)) if conclusions
+                 else "*(Sin conclusiones)*")
+    lines.append("")
+
+    if is_part:
+        lines.append("## 📝 Transcripción de esta parte")
+        lines.append("")
+        lines.append(_format_running_text(part_text))
+        lines.append("")
+    else:
+        lines.append("## 📄 Transcripción completa")
+        lines.append("")
+        lines.append("```text")
+        lines.append(_format_running_text(part_text))
+        lines.append("```")
+
+    Path(output_md).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_md, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    tag = f"de la parte {part_idx} " if is_part else ""
+    log(f"Markdown {tag}escrito -> {output_md}")
+
+
 def save_transcript_checkpoint(transcript: dict, output_md: str) -> str:
     """Save the plain transcript next to the report so progress isn't lost.
 
@@ -795,7 +1056,7 @@ def save_transcript_checkpoint(transcript: dict, output_md: str) -> str:
     """
     base = Path(output_md)
     txt_path = base.with_name(base.stem + "_transcripcion.txt")
-    text = transcript.get("text", "") or ""
+    text = _format_running_text(transcript.get("text", "") or "")
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     log(f"Checkpoint transcripción -> {txt_path}")
@@ -805,87 +1066,6 @@ def save_transcript_checkpoint(transcript: dict, output_md: str) -> str:
 # ---------------------------------------------------------------------------
 # Transcript mode: structured notes from a plain-text meeting transcript
 # ---------------------------------------------------------------------------
-def build_transcript_markdown(
-    transcript_path: str,
-    source_text: str,
-    analysis: dict,
-    ollama_model: str,
-    output_md: str,
-) -> None:
-    """Generate a standalone notes report (ideas/discusiones/conclusiones)
-    from a plain-text transcript, as a separate .md file."""
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = []
-    lines.append(f"# 📝 Apuntes: {Path(transcript_path).name}")
-    lines.append("")
-    lines.append(f"- **Generado:** {now}")
-    lines.append(f"- **Modelo LLM:** {ollama_model}")
-    lines.append("")
-
-    if analysis.get("titulo"):
-        lines.append(f"## 🏷️ {analysis['titulo']}")
-        lines.append("")
-
-    lines.append("## 📌 Resumen")
-    lines.append("")
-    lines.append(analysis.get("resumen", "*(Sin resumen disponible)*"))
-    lines.append("")
-
-    lines.append("## 🧠 Ideas principales")
-    lines.append("")
-    ideas = analysis.get("ideas", [])
-    if ideas:
-        for i, idea in enumerate(ideas, 1):
-            lines.append(f"### {i}. {idea.get('titulo', 'Sin título')}")
-            lines.append("")
-            desc = idea.get("descripcion", "")
-            if desc:
-                lines.append(desc)
-                lines.append("")
-    else:
-        lines.append("*(No se detectaron ideas principales.)*")
-        lines.append("")
-
-    lines.append("## 💬 Discusiones / Puntos debatidos")
-    lines.append("")
-    discussions = analysis.get("discusiones", [])
-    if discussions:
-        lines.append("- " + "\n- ".join(str(d) for d in discussions))
-    else:
-        lines.append("*(Sin discusiones destacadas)*")
-    lines.append("")
-
-    lines.append("## 🔑 Conceptos clave")
-    lines.append("")
-    concepts = analysis.get("conceptos", [])
-    if concepts:
-        lines.append("- " + "\n- ".join(str(c) for c in concepts))
-    else:
-        lines.append("*(Sin conceptos destacados)*")
-    lines.append("")
-
-    lines.append("## ✅ Conclusiones")
-    lines.append("")
-    conclusions = analysis.get("conclusiones", [])
-    if conclusions:
-        lines.append("- " + "\n- ".join(str(c) for c in conclusions))
-    else:
-        lines.append("*(Sin conclusiones)*")
-    lines.append("")
-
-    lines.append("## 📄 Transcripción completa")
-    lines.append("")
-    lines.append("```text")
-    lines.append(source_text.rstrip("\n"))
-    lines.append("```")
-
-    with open(output_md, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-
-    log(f"Markdown written -> {output_md}")
-
-
 def split_text(text: str, chunk_chars: int = 6000) -> list:
     """Split a long transcript into parts of ~chunk_chars characters.
 
@@ -916,6 +1096,37 @@ def split_text(text: str, chunk_chars: int = 6000) -> list:
     if text:
         chunks.append(text)
     return chunks
+
+
+def _format_running_text(text: str) -> str:
+    """Hace legible un texto que llegó "corrido" en una sola línea larga.
+
+    Respeta los párrafos existentes (punto aparte: salto de línea en blanco)
+    y pone cada frase (punto seguido: '.', '!' o '?') en su propia línea.
+    No rompe números decimales ('11.59'), ni toca textos que ya estén
+    multilínea (p. ej. transcripciones con timestamps).
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    paras = re.split(r"\n[ \t]*\n", text)
+    blocks = []
+    for para in paras:
+        para = re.sub(r"[ \t]+", " ", para).strip()
+        if not para:
+            continue
+        if "\n" in para or len(para) <= 160:
+            blocks.append(para)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        wrapped = []
+        for s in sentences:
+            if wrapped and re.match(r"^\d", s):
+                wrapped[-1] += " " + s
+            else:
+                wrapped.append(s)
+        blocks.append("\n".join(w for w in wrapped if w.strip()))
+    return "\n\n".join(blocks)
 
 
 def transcript_to_md(
@@ -958,42 +1169,71 @@ def transcript_to_md(
     else:
         output_md = str(Path(output_md).resolve())
 
+    # Textos largos: se dividen automáticamente en partes de ~ANALYSIS_PART_CHARS
+    # aunque no se pase --split-chars, para que cada parte tenga su propio .md
+    # y el informe completo fusione todo (resumen ejecutivo único incluido).
+    if split_chars <= 0 and len(text) > ANALYSIS_PART_CHARS:
+        split_chars = ANALYSIS_PART_CHARS
+        log(
+            f"Texto largo ({len(text)} chars): división automática en partes "
+            f"de ~{split_chars} (cada parte generará su propio .md).",
+            "AUDITV",
+        )
+
     parts = split_text(text, split_chars) if split_chars > 0 else [text]
+    t_total = time.time()
+    log(f"INICIO de apuntes desde: {transcript_path}", "AUDITV")
     if len(parts) == 1:
-        return _transcript_part_to_md(
+        _out = _transcript_part_to_md(
             transcript_path, text, ollama_model, use_llm, output_md
         )
+        log(
+            f"✅ FIN de apuntes en {int(time.time() - t_total)} s. "
+            f"Informe -> {_out}",
+            "AUDITV",
+        )
+        return _out
 
     log(f"Texto dividido en {len(parts)} partes de ~{split_chars} caracteres.")
     stem = Path(transcript_path).stem
-    outputs = []
-    analyses = []
-    for i, part in enumerate(parts, 1):
-        part_txt = base_dir / f"{stem}_parte{i}.txt"
-        part_txt.write_text(part, encoding="utf-8")
-        part_md = base_dir / f"{stem}_parte{i}_apuntes.md"
-        analysis = _transcript_part_analysis(part, ollama_model, use_llm)
-        analyses.append(analysis)
-        build_transcript_markdown(
-            str(part_txt), part, analysis, ollama_model, str(part_md)
-        )
-        outputs.append(str(part_md))
+
+    # Mismo motor que el flujo de video: divide, analiza cada parte y guarda
+    # el .txt + .md de cada bache (out_md), devolviendo además lo necesario
+    # para ensamblar el informe completo fusionado.
+    _merged, parts_used, analyses = analyze_transcript_in_parts(
+        text,
+        ollama_model,
+        include_timestamps=False,
+        out_md=str(base_dir / stem),
+        video_path=transcript_path,
+        part_chars=split_chars,
+        with_details=True,
+        use_llm=use_llm,
+    )
+
+    outputs = [
+        str(base_dir / f"{stem}_partes" / f"{stem}_parte{i}.md")
+        for i in range(1, len(parts_used) + 1)
+    ]
 
     # Informe completo: junta lo ya analizado (sin re-analizar el texto) +
     # transcripción completa. Todo ensamblado a partir de cada parte.
     combined_md = base_dir / f"{stem}_completo_apuntes.md"
     build_combined_transcript_markdown(
-        stem, parts, analyses, ollama_model, text, str(combined_md)
+        stem, parts_used, analyses, ollama_model, text, str(combined_md)
     )
     outputs.append(str(combined_md))
 
-    # Los .txt de partes eran temporales: se borran (los .md se conservan).
-    for i in range(1, len(parts) + 1):
-        try:
-            (base_dir / f"{stem}_parte{i}.txt").unlink()
-        except OSError:
-            pass
-    log("Partes temporales .txt eliminadas; se conservan los .md.", "INFO")
+    log(
+        f"Conservados {len(parts_used)} baches (_parteN.txt + _parteN.md) en "
+        f"la carpeta '{stem}_partes/'; informe completo -> {combined_md.name}.",
+        "INFO",
+    )
+    log(
+        f"✅ FIN de apuntes en {int(time.time() - t_total)} s. "
+        f"Informe -> {combined_md}",
+        "AUDITV",
+    )
     return "\n".join(outputs)
 
 
@@ -1018,14 +1258,16 @@ def _transcript_part_to_md(
     use_llm: bool,
     output_md: str,
 ) -> str:
-    """Analyze one transcript part and write its _apuntes.md."""
+    """Analyze one transcript part and write its .md (standalone report)."""
     analysis = _transcript_part_analysis(text, ollama_model, use_llm)
-    build_transcript_markdown(
-        transcript_path=transcript_path,
-        source_text=text,
+    build_part_markdown(
+        source_path=transcript_path,
+        part_idx=1,
+        part_total=1,
+        part_text=text,
         analysis=analysis,
-        ollama_model=ollama_model,
         output_md=output_md,
+        ollama_model=ollama_model,
     )
     return output_md
 
@@ -1040,11 +1282,16 @@ def build_combined_transcript_markdown(
 ) -> str:
     """Write a combined report assembling the analyses of all parts.
 
-    No new LLM call: it joins the resumen/ideas/discusiones/conceptos/
-    conclusiones already extracted per part and appends the full transcript.
+    Joins the resumen/ideas/discusiones/conceptos/conclusiones already
+    extracted per part, merges the partial summaries into a single executive
+    summary (best-effort LLM pass) and appends the full transcript.
     """
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n = len(parts)
+
+    merged_resumen = ""
+    if n > 1:
+        merged_resumen = _merge_resumenes_with_llm(analyses, ollama_model)
 
     lines = []
     lines.append(f"# 📚 Reunión completa: {stem}")
@@ -1053,6 +1300,12 @@ def build_combined_transcript_markdown(
     lines.append(f"- **Modelo LLM:** {ollama_model}")
     lines.append(f"- **Partes analizadas:** {n}")
     lines.append("")
+
+    if merged_resumen:
+        lines.append("## 📌 Resumen ejecutivo (fusionado)")
+        lines.append("")
+        lines.append(_format_running_text(merged_resumen))
+        lines.append("")
 
     def part_list_section(title: str, key: str) -> None:
         lines.append(f"## {title}")
@@ -1072,7 +1325,7 @@ def build_combined_transcript_markdown(
     for i, a in enumerate(analyses, 1):
         lines.append(f"### Parte {i}")
         lines.append("")
-        lines.append(str(a.get("resumen") or "*(Sin resumen)*"))
+        lines.append(_format_running_text(str(a.get("resumen") or "*(Sin resumen)*")))
         lines.append("")
 
     lines.append("## 🧠 Ideas principales por parte")
@@ -1118,7 +1371,7 @@ def build_combined_transcript_markdown(
     lines.append("## 📄 Transcripción completa")
     lines.append("")
     lines.append("```text")
-    lines.append(full_source.rstrip("\n"))
+    lines.append(_format_running_text(full_source))
     lines.append("```")
 
     with open(output_md, "w", encoding="utf-8") as fh:
@@ -1293,9 +1546,11 @@ def video_to_md(
     """
     download_paths = []
     is_remote = is_url(video_path)
+    t_total = time.time()
 
     if is_remote:
         os.makedirs(DEFAULT_DOWNLOAD_DIR, exist_ok=True)
+        log(f"Descargando video desde URL: {video_path}", "AUDITV")
         video_path = download_video(
             video_path,
             DEFAULT_DOWNLOAD_DIR,
@@ -1304,6 +1559,10 @@ def video_to_md(
             live_from_start=live_from_start,
         )
         download_paths.append(video_path)
+        log(
+            f"Descarga completada en {int(time.time() - t_total)} s -> {video_path}",
+            "AUDITV",
+        )
 
     video_path = str(Path(video_path).resolve())
     if not os.path.exists(video_path):
@@ -1345,23 +1604,41 @@ def video_to_md(
         os.makedirs(frames_dir, exist_ok=True)
 
     device = detect_device(device_hint)
+    log(f"INICIO del análisis de: {video_path}", "AUDITV")
+    log(f"Informe final -> {output_md}", "AUDITV")
+    if frames_dir:
+        log(f"Director de frames -> {frames_dir}", "AUDITV")
 
     with tempfile.TemporaryDirectory(prefix="video_to_md_") as tmpdir:
         # 1. Extract audio
         audio_path = os.path.join(tmpdir, "audio.wav")
+        log("Paso 1/5: extrayendo audio (ffmpeg)...", "AUDITV")
+        _t = time.time()
         extract_audio(video_path, audio_path)
+        log(f"Paso 1/5 completado ({int(time.time() - _t)} s).", "AUDITV")
 
         # 2. Transcribe (+ checkpoint del texto por si el equipo se apaga)
+        log(f"Paso 2/5: transcribiendo audio con Whisper ({whisper_model}/{device})...", "AUDITV")
+        _t = time.time()
         transcript = transcribe_audio(audio_path, whisper_model, device)
         save_transcript_checkpoint(transcript, output_md)
+        log(
+            f"Paso 2/5 completado ({int(time.time() - _t)} s): "
+            f"{len(transcript.get('segments') or [])} segmentos.",
+            "AUDITV",
+        )
 
         # 3. Extract frames
         frames = []
         if not skip_frames:
+            log(f"Paso 3/5: extrayendo frames (cada {frame_interval}s)...", "AUDITV")
+            _t = time.time()
             frames = extract_frames(video_path, frames_dir, frame_interval)
+            log(f"Paso 3/5 completado ({int(time.time() - _t)} s, {len(frames)} frames).", "AUDITV")
 
         # 4. Informe parcial (transcripción + frames) para no perder progreso
         #    si el análisis LLM no termina (corte de luz, apagado, etc.).
+        log("Paso 4/5: escribiendo informe parcial (transcripción + frames)...", "AUDITV")
         partial = {"resumen": "*(Análisis LLM en curso o pendiente)*"}
         build_markdown(
             video_path=video_path,
@@ -1379,10 +1656,17 @@ def video_to_md(
         # 5. Analyze with Ollama (best-effort)
         analysis = {}
         if use_llm:
+            log(f"Paso 5/5: analizando con LLM ({ollama_model}) por partes...", "AUDITV")
+            _t = time.time()
             try:
                 analysis = analyze_transcript_in_parts(
-                    transcript, ollama_model, include_timestamps=True
+                    transcript,
+                    ollama_model,
+                    include_timestamps=True,
+                    out_md=output_md,
+                    video_path=video_path,
                 )
+                log(f"Paso 5/5 completado ({int(time.time() - _t)} s).", "AUDITV")
             except Exception as exc:
                 log(f"Ollama analysis skipped: {exc}", "WARN")
                 analysis = {"resumen": "*(No se pudo analizar con Ollama)*"}
@@ -1391,6 +1675,7 @@ def video_to_md(
             analysis = {"resumen": "*(Análisis LLM omitido)*"}
 
     # 6. Rebuild the markdown with the LLM analysis.
+    log("Escribiendo informe final con el análisis LLM...", "AUDITV")
     build_markdown(
         video_path=video_path,
         transcript=transcript,
@@ -1411,6 +1696,11 @@ def video_to_md(
         frames_dir=frames_dir,
     )
 
+    log(
+        f"✅ FIN del análisis en {int(time.time() - t_total)} s. "
+        f"Informe -> {output_md}",
+        "AUDITV",
+    )
     return output_md
 
 
@@ -1448,7 +1738,10 @@ def main(argv=None) -> int:
     parser.add_argument("--split-chars", type=int, default=0,
                          help="Con --transcript: dividir el texto en partes de N "
                               "caracteres (~6000 recomendado) y generar un informe "
-                              "por parte. 0 = analizar el texto completo (con truncado)")
+                              "por parte. 0 (default) = automático: si el texto es "
+                              "largo (> %d chars) se divide igualmente para generar "
+                              "los .md por parte y el informe completo fusionado"
+                              % ANALYSIS_PART_CHARS)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"),
                         default=DEVICE_HINT,
                         help="Dispositivo para Whisper: auto (default), cpu "
