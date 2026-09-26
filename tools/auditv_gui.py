@@ -70,6 +70,10 @@ import hardware  # noqa: E402
 import video_to_md  # noqa: E402
 
 _DEFAULT_OUTDIR = str(_PROJECT / "informes")
+# Etiqueta de la línea del log donde se describe el archivo escolhido (ver
+# `_log_media`). Con `_FUENTE` la misma información, ya sembrada por el log al
+# arrancar: `_MEDIA_TAG` es la que se ve **antes** de darle al botón.
+_MEDIA_TAG = "[ARCHIVO]"
 # Fichero de estado que escribe el CLI y lee este panel (ver video_to_md.py).
 _STATUS_FILE = str(_PROJECT / ".auditv_status.json")
 
@@ -728,29 +732,41 @@ def pick_directory() -> str:
 # Tab 1: Video / URL
 # ---------------------------------------------------------------------------
 def _describe_path(path) -> str:
-    """El formato REAL del archivo de la ruta, leído por ffprobe.
+    """El formato REAL del archivo, en una línea, leído por ffprobe.
 
     No se fía de la extensión (miente bastante). Si el archivo no existe o
     ffprobe no dice nada, lo dice con claridad en vez de inventar un formato.
     """
     path = (path or "").strip().strip('"').strip("'")
     if not path:
-        return "_Escribe una ruta y se ve aquí el formato real._"
+        return ""
     try:
         info = video_to_md.describe_media(path)
     except Exception as exc:                    # ffprobe ausente, ruta con
-        return f"⚠️ No se ha podido leer el archivo: {exc}"  # tildes raras…
-
+        return f"no se ha podido leer el archivo: {exc}"  # tildes raras…
     if not info["exists"]:
-        return f"⚠️ No existe el archivo: `{info['path']}`"
-
+        return f"no existe el archivo: {info['path']}"
     fmt = video_to_md.fmt_media(info)
     if info["kind"] == "audio":
-        return (f"🎙 **Solo audio** — {fmt}\n\n"
-                "Se transcribe igual, pero no se sacarán frames (no hay imagen).")
+        return f"solo audio — {fmt} (se transcribe igual, pero sin frames)"
     if info["kind"] == "video":
-        return f"🎬 **Con video** — {fmt}"
-    return f"⚠️ {fmt}"
+        return f"con video — {fmt}"
+    return fmt
+
+
+def _log_media(path, log_actual="") -> str:
+    """`_describe_path` al log, en vez de a un componente aparte.
+
+    El formato se ve al escribir la ruta o al subir el archivo, sin abrir una
+    sección más en la interfaz. Se **sustituye** la línea `[ARCHIVO]` anterior
+    (el evento salta en cada tecla) en vez de ir apilando una detrás de otra.
+    """
+    lineas = [l for l in (log_actual or "").splitlines()
+              if not l.startswith(_MEDIA_TAG)]
+    texto = _describe_path(path)
+    if texto:
+        lineas.append(f"{_MEDIA_TAG} {texto}")
+    return "\n".join(lineas[-200:])
 
 
 def on_run_video(
@@ -916,34 +932,42 @@ def build_app() -> gr.Blocks:
         gpu_panel = gr.HTML(gpu_panel_html())
         with gr.Tab("Video / URL"):
             # ── Origen del material ─────────────────────────────────────
-            # Un solo panel a todo el ancho de la pestaña: dentro van, en
-            # orden, la subida del archivo, la ruta local y la URL. Se usa
-            # `gr.Column` (no `gr.Row`) a propósito: dentro de una fila
-            # Gradio reparte el ancho entre las columnas y el panel se
-            # quedaría estrecho; así ocupa el 100 % respetando el padding
-            # que ya pone la página. `variant="panel"` es el contenedor que
-            # trae borde, fondo y radio del tema (claro y oscuro).
+            # Un panel a todo el ancho de la pestaña (se usa `gr.Column`, no
+            # `gr.Row`, a propósito: dentro de una fila Gradio reparte el
+            # ancho y el panel se quedaría estrecho). `variant="panel"` es el
+            # contenedor que trae borde, fondo y radio del tema.
+            # Dentro, una fila con la zona de subida a la izquierda y, a su
+            # lado, la ruta local y la URL. Los campos se dejan con su alto
+            # normal y la zona de subida se baja a la misma altura (ver el
+            # bloque de CSS de `#av_origen`) para que no sobre aire.
             with gr.Column(variant="panel", elem_id="av_origen"):
-                file_in = gr.File(
-                    # Sin lista de extensiones: se acepta cualquier formato
-                    # (video, audio o contenedor raro) y ffprobe decide.
-                    label="Subir archivo",
-                )
-                # Un solo campo de ruta para video y audio: el formato lo pone
-                # el código (ffprobe) al escribirla, no el usuario ni la
-                # extensión del archivo.
-                path_in = gr.Textbox(
-                    label="Video o audio local (cualquier formato)",
-                    info="Debajo se ve el formato real detectado; si es solo "
-                         "audio no habrá frames.",
-                )
-                url_in = gr.Textbox(
-                    label="URL (YouTube, Drive, cualquier plataforma)",
-                    placeholder="https://…",
-                )
-                src_info = gr.Markdown(
-                    "_Escribe una ruta y se ve aquí el formato real._"
-                )
+                # Las dos mitades del mismo ancho: `scale=1` en las dos (Gradio
+                # reparte por `scale`, y con 1 y 2 salían 389 px y 779 px).
+                with gr.Row():
+                    with gr.Column(min_width=320, scale=1):
+                        file_in = gr.File(
+                            # Sin lista de extensiones: se acepta cualquier
+                            # formato (video, audio o contenedor raro) y
+                            # ffprobe decide.
+                            label="Subir archivo",
+                        )
+                    with gr.Column(elem_id="av_origen_campos", scale=1):
+                        # El texto de ayuda va en el `info` del propio campo, no
+                        # en un Markdown aparte al lado: así Gradio lo mete en el
+                        # MISMO bloque `form` que la etiqueta y no se parte en
+                        # dos secciones. Un solo campo de ruta para video y
+                        # audio: el formato lo pone el código (ffprobe) al
+                        # escribirla, no el usuario ni la extensión.
+                        path_in = gr.Textbox(
+                            label="Video o audio local (cualquier formato)",
+                            info="Escribe una ruta o pega una URL y verás aquí "
+                                 "el formato real. Si es solo audio, no habrá "
+                                 "frames.",
+                        )
+                        url_in = gr.Textbox(
+                            label="URL (YouTube, Drive, cualquier plataforma)",
+                            placeholder="https://…",
+                        )
             with gr.Row():
                 outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta de salida (informe + frames)")
                 outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
@@ -995,12 +1019,12 @@ def build_app() -> gr.Blocks:
                 outputs=[status],
             )
             outdir_btn.click(pick_directory, outputs=[outdir])
-            # El formato se lee del archivo, no de la extensión: se avisa en
-            # cuanto se escribe la ruta o se sube el archivo.
-            path_in.change(_describe_path, inputs=path_in, outputs=src_info,
-                           show_progress="hidden")
-            file_in.change(_describe_path, inputs=file_in, outputs=src_info,
-                           show_progress="hidden")
+            # El formato se lee del archivo, no de la extensión, y se dice en el
+            # log (no en un componente aparte, que sería otra sección).
+            path_in.change(_log_media, inputs=[path_in, log_box],
+                           outputs=[log_box], show_progress="hidden")
+            file_in.change(_log_media, inputs=[file_in, log_box],
+                           outputs=[log_box], show_progress="hidden")
             llm_refresh.click(_refresh_models, outputs=[llm_m])
             llm_gpu_refresh.click(
                 lambda: gr.update(choices=list_gpu_indices()), outputs=[llm_gpu_sel]
@@ -1165,6 +1189,47 @@ _LAYOUT_CSS = """<style>
    ancho mínimo de los campos empuja al panel y el texto se parte en dos
    líneas. */
 #av_origen > * {
+  min-width: 0 !important;
+}
+/* La zona de baja: se deja como la pinta Gradio (los tres textos, el icono y
+   la forma) pero más baja, porque a 240 px (`--size-60`) quedaba un agujero
+   debajo al lado de los campos de texto. Medido: el contenido interno ocupa
+   ~104 px, así que 11rem (~176 px) es lo que hace falta para que respire sin
+   quedar apretado, y de paso empareja el alto con la columna de campos. */
+#av_origen .upload-container,
+#av_origen .wrap {
+  height: 11rem !important;
+}
+/* El texto de ayuda del campo de ruta va en la MISMA línea que su etiqueta, no
+   encima como lo pone Gradio. Por dentro el `label` es una columna con tres
+   hijos: el `span` de la etiqueta, el `div.info-text` y el
+   `div.input-container`. Pasándolo a `display: flex` con `flex-wrap`, la
+   etiqueta y el texto se quedan en la primera línea y el input salta entero a
+   la segunda. */
+#av_origen_campos label {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: baseline !important;
+  column-gap: .4rem !important;
+  row-gap: 0 !important;
+}
+#av_origen_campos label > span {
+  flex: 0 0 auto !important;
+  max-width: 100% !important;
+}
+#av_origen_campos label > .info-text {
+  /* `flex-basis: 0` (y no `auto`) es lo que evita que salte de línea: con base
+     `auto` el navegador mide el texto a una línea (687 px), ve que no cabe en
+     los ~320 px que quedan y lo pasa entero a la línea siguiente. */
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+}
+#av_origen_campos label > .input-container {
+  flex: 1 1 100% !important;
+  min-width: 0 !important;
+}
+#av_origen_campos {
   min-width: 0 !important;
 }
 /* Panel de la IA: mismo relleno que el de origen. */

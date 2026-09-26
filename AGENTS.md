@@ -169,8 +169,46 @@ ancho de la pestaña:
   (`padding`, `margin-bottom`, `gap`) y pone `min-width: 0` a los hijos para que
   los campos puedan encogerse en pantallas estrechas.
 - Al añadir secciones, replica el patrón: `panel` + `elem_id` + un bloque de CSS
-  propio. Los `elem_id` ya usados: `av_origen`, `av_ia`, `av_log_video`,
-  `av_log_notes`, `av_log_live`.
+  propio. Los `elem_id` ya usados: `av_origen`, `av_origen_campos`, `av_ia`,
+  `av_log_video`, `av_log_notes`, `av_log_live`. **Ojo**: `elem_id` va en el
+  `gr.Column` del panel, no en un `gr.Textbox`; si se pone en el campo, el id cae
+  en el `div.block` que lo envuelve, no en el `textarea`.
+
+**`av_origen`: dos mitades iguales y texto de ayuda en la línea de la etiqueta.**
+La sección de origen es una `gr.Row` con la zona de subida a la izquierda y la
+columna `av_origen_campos` a su lado (ruta local y URL):
+
+- Las dos mitades con `scale=1`. Gradio reparte el ancho de una fila por
+  `scale`, así que con `scale=1` y `scale=2` salían 389 px y 779 px; con `1` y
+  `1` sale 584 px y 584 px. Si añades un tercer hijo, `scale` a los tres.
+- **Los campos se quedan con su alto natural** (el `textarea` con sus 40 px de
+  `rows`): no los estires. Antes se intentaron `flex: 1 1 0` en la cadena
+  `div.form > div.block > label > div.input-container > textarea`,
+  `align-items: stretch` en el `input-container` y `equal_height=True` en la
+  fila, y **no hacía nada**: el `textarea` es un item flex de *ancho* dentro de
+  un contenedor en `align-items: flex-end`, así que se queda con su alto natural
+  pegado abajo. Para que la sección quede compacta, lo que se baja es la **zona
+  de subida** (11rem en vez de los 240 px de Gradio), que es lo único que
+  sobraba.
+- El texto de ayuda va en el **`info` del propio campo**, no en un `gr.Markdown`
+  al lado: así Gradio lo mete en el MISMO bloque `form` que la etiqueta y no se
+  parte en dos secciones. Por dentro, el `label` es una columna con tres hijos
+  (`span` de la etiqueta, `div.info-text`, `div.input-container`); el bloque de
+  CSS de `#av_origen_campos label` lo pasa a `display: flex` con `flex-wrap` y
+  `flex-basis: 100%` en el `input-container`, de modo que la etiqueta y el texto
+  quedan en la primera línea y el input salta entero a la segunda.
+  El `info-text` necesita **`flex: 1 1 0`**, no `1 1 auto`: con base `auto` el
+  navegador lo mide a una línea (687 px), ve que no cabe en lo que queda al lado
+  de la etiqueta y lo pasa entero a la línea siguiente.
+- El formato del archivo **va al log**, no a un componente propio: `_log_media`
+  (con `_describe_path` debajo, que pregunta a ffprobe) se dispara con
+  `path_in.change` y `file_in.change` y **sustituye** la línea `[ARCHIVO]`
+  anterior en el `Textbox` del log (`show_progress="hidden"`), en vez de apilar
+  una por tecla. Se pidió quitar el `gr.Markdown` que había debajo del campo
+  (era una sección más y partía la de origen en dos), pero **la funcionalidad
+  se queda**: que no haya un `prose` en `#av_origen` no significa que el formato
+  deje de mostrarse. Al arrancar sale otra vez en el log con el `preamble`
+  (`[FUENTE] …`).
 
 **Botones: en la fila de su campo, y pequeños.** Un botón que pertenece a un
 campo (actualizar modelos, redetectar GPUs) va en la **misma `gr.Row`** que su
@@ -197,10 +235,6 @@ con extensiones mentirosas: un `.mp4` que solo tiene audio se trata como audio y
 no intenta sacar frames, y un `.m4a` o `.txt` que sí tienen pista de vídeo se
 tratan como video.
 
-**Aviso del archivo bajo el campo.** `_describe_path(ruta)` devuelve una línea
-Markdown con lo que hay en el archivo y se dispara con `path_in.change` y
-`file_in.change`, así que el usuario ve el formato antes de arrancar.
-
 **Primera línea del log.** `_run_cli_streaming(..., preamble=...)` siembra la
 línea `[FUENTE] …` en la lista de líneas del log; si no, el primer `yield` la
 perdería y el usuario no sabría qué se eligió.
@@ -215,12 +249,14 @@ Gradio. Usa solo clases sin hash (`upload-container`, `icon-wrap`, `wrap`,
 `_FOOTER_CSS`, concatenados en `head=`.
 
 **No toques el interior del área de subida.** Se deja tal como lo pinta Gradio
-(240 px de alto, `--size-60`, y los textos en tres líneas). Se probó a
-compactarla y a poner «Coloque el archivo aquí - o - Haga clic para cargar» en
-una sola línea y no funciona con CSS: dentro de `.upload-container` el texto no
-es un párrafo, son items flex distintos (en un contenedor `display:flex` cada
-trozo de texto y el `<span class="or">` se convierten en item), así que
-`white-space: nowrap` no tiene nada que arreglar. Juntarlos exigiría rehacer la
+(los textos en tres líneas); lo único que se cambia es su `height`
+(`#av_origen .upload-container, #av_origen .wrap { height: 11rem }`, para que
+empareje con la columna de campos). Se probó además a poner «Coloque el archivo
+aquí - o - Haga clic para cargar» en una sola línea y no funciona con CSS:
+dentro de `.upload-container` el texto no es un párrafo, son items flex
+distintos (en un contenedor `display:flex` cada trozo de texto y el
+`<span class="or">` se convierten en item), así que `white-space: nowrap` no
+tiene nada que arreglar. Juntarlos exigiría rehacer la
 maqueta del widget; no compensa.
 
 **Cuidado con las generadoras de Gradio.** Una función de evento que hace
