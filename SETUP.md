@@ -90,10 +90,12 @@ Si genera el `.md` con resumen, transcripción y frames, todo funciona.
 
 ## 6. Uso con un agente
 
-- Copia el contenido de `CLAUDE.md` a las instrucciones del agente
-  (o mantenlo en la raíz: la mayoría de los agentes lo leen automáticamente).
-- El agente debe ejecutar `./analyze_video.sh ...` desde la raíz del proyecto.
-- Según `CLAUDE.md`, el agente debe preguntar siempre al usuario dónde guardar
+- Las instrucciones del agente están en **`AGENTS.md`** (en la raíz), que es el
+  nombre que leen Codex, Cursor, Cline, Windsurf y compañía. `CLAUDE.md` es solo
+  un puntero de una línea para que Claude Code lo cargue automáticamente.
+- El agente debe ejecutar `./analyze_video.sh ...` desde la raíz del proyecto
+  (en Windows, `venv\Scripts\python tools\video_analyzer.py --video ...`).
+- Según `AGENTS.md`, el agente debe preguntar siempre al usuario dónde guardar
   el informe y los frames antes de ejecutar (`--output-dir` o `--output` +
   `--frames-dir`).
 

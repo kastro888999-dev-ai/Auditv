@@ -644,12 +644,121 @@ def has_video_stream(path: str) -> bool:
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=30,
         )
-        if out.returncode == 0 and out.stdout.strip():
-            return True
+        if out.returncode == 0:
+            # Si ffprobe ha contestado se le cree siempre. Un archivo de solo
+            # audio devuelve la lista vacía, así que aquí se responde False
+            # aunque la extensión diga ".mp4": manda lo que hay DENTRO del
+            # archivo, no su nombre. (Antes caía al heurístico y un audio
+            # renombrado a .mp4 intentaba sacar frames que no existen.)
+            return bool(out.stdout.strip())
     except Exception:
         pass
-    # Fallback heurístico por extensión.
+    # ffprobe no está o falló: entonces sí, la extensión es lo único que hay.
     return Path(path).suffix.lower() not in AUDIO_EXTS
+
+
+def describe_media(path: str) -> dict:
+    """Qué es REALMENTE el archivo: contenedor, pistas, duración y tamaño.
+
+    El formato se saca del contenido con ffprobe, nunca de la extensión: la
+    extensión miente a menudo (un `.mp4` renombrado de un MKV, un audio con
+    extensión de video, un `.mp3` que es un FLAC). La GUI usa esto para
+    enseñarle al usuario lo que ha elegido antes de gastar media hora de
+    transcripción, y el log del análisis lo repite por si acaso.
+    """
+    p = Path(path)
+    info = {
+        "path": str(p),
+        "exists": p.exists(),
+        "ext": p.suffix.lower().lstrip(".").upper(),
+        "container": "",
+        "duration_s": 0.0,
+        "size_mb": 0.0,
+        "video": "",
+        "audio": "",
+        "width": 0,
+        "height": 0,
+        "channels": 0,
+        "kind": "",       # "video", "audio" o "" si no se pudo leer
+        "by_ext": False,  # True si el tipo se dedujo de la extensión
+    }
+    if not p.exists():
+        return info
+    try:
+        info["size_mb"] = p.stat().st_size / (1024 * 1024)
+    except OSError:
+        pass
+
+    data = {}
+    try:
+        out = subprocess.run(
+            [*_tool_cmd("ffprobe"), "-v", "error", "-show_format",
+             "-show_streams", "-of", "json", "-i", str(p)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60,
+        )
+        if out.returncode == 0:
+            data = json.loads(out.stdout or "{}")
+    except Exception:
+        data = {}
+
+    fmt = data.get("format") or {}
+    info["container"] = str(fmt.get("format_name") or "")
+    try:
+        info["duration_s"] = float(fmt.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    for st in data.get("streams") or []:
+        codec_type = st.get("codec_type")
+        if codec_type == "video" and not info["video"]:
+            info["video"] = str(st.get("codec_name") or "")
+            info["width"] = int(st.get("width") or 0)
+            info["height"] = int(st.get("height") or 0)
+        elif codec_type == "audio" and not info["audio"]:
+            info["audio"] = str(st.get("codec_name") or "")
+            info["channels"] = int(st.get("channels") or 0)
+
+    if info["video"] or info["audio"]:
+        info["kind"] = "video" if info["video"] else "audio"
+    else:
+        # ffprobe no dijo nada (no está, o el archivo está roto): se cae a la
+        # extensión, que para decidir solo-video/solo-audio basta.
+        if p.suffix.lower() in AUDIO_EXTS:
+            info["kind"] = "audio"
+            info["by_ext"] = True
+    return info
+
+
+def fmt_media(info: dict) -> str:
+    """El formato detectado, en una línea legible para la GUI y para el log."""
+    if not info or not info.get("exists"):
+        return "El archivo no existe."
+    parts = []
+    if info.get("container"):
+        # ffprobe devuelve listas tipo "mov,mp4,m4a,3gp,3g2,mj2"; quedarse con
+        # el primero es lo que la gente llama "el formato".
+        parts.append(str(info["container"]).split(",")[0].upper())
+    if info.get("width") and info.get("height"):
+        parts.append(f"video {info['width']}x{info['height']} "
+                     f"{info['video']}".strip())
+    elif info.get("audio"):
+        n = int(info.get("channels") or 0)
+        canales = f", {n} {'canal' if n == 1 else 'canales'}" if n else ""
+        parts.append(f"solo audio {info['audio']}{canales}".strip())
+    else:
+        parts.append("sin pistas de audio ni de video")
+    dur = float(info.get("duration_s") or 0)
+    if dur > 0:
+        parts.append(f"{int(dur // 60)} min {int(dur % 60):02d} s")
+    if info.get("size_mb"):
+        # Por debajo de 1 MB, los KB dan una cifra útil; con "%.0f MB" todo
+        # archivo pequeño salía como "0 MB".
+        tam = (f"{info['size_mb']:.0f} MB" if info["size_mb"] >= 1
+               else f"{max(1, round(info['size_mb'] * 1024))} KB")
+        parts.append(tam)
+    if info.get("by_ext"):
+        parts.append("(tipo deducido de la extensión: ffprobe no lo leyó)")
+    return " · ".join(x for x in parts if x)
 
 
 # ---------------------------------------------------------------------------

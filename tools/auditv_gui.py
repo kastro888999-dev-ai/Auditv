@@ -60,9 +60,14 @@ _LIVE_SCRIPT = str(_PROJECT / "tools" / "live_meeting.py")
 
 # El módulo `hardware` vive en la raíz del proyecto: se importa para no
 # duplicar (ni volver a endurecer) la detección de GPU/modelos.
+# `video_to_md` se importa por lo mismo: el formato real de un archivo lo
+# leen sus funciones de ffprobe, y aquí solo se llama para describírselo al
+# usuario antes de lanzar el análisis. Importarlo no ejecuta el pipeline
+# (todo lo grave va dentro de `main()`, bajo el `if __name__`).
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 import hardware  # noqa: E402
+import video_to_md  # noqa: E402
 
 _DEFAULT_OUTDIR = str(_PROJECT / "informes")
 # Fichero de estado que escribe el CLI y lee este panel (ver video_to_md.py).
@@ -331,8 +336,21 @@ def _metric(label, value, color=None, extra="") -> str:
             f"<b style='color:{col}'>{value}</b>{extra}</span>")
 
 
-def _component_row(name, model, device, res, vram_mb=None) -> tuple:
-    """(etiqueta, valor) de un componente del panel con su consumo."""
+def _component_chip(icon, name, body) -> str:
+    """Bloque de un componente (Whisper, IA local) para la fila del equipo.
+
+    Cada uno va en su propia celda, con una línea vertical que los separa de las
+    métricas del sistema, para que se lean en horizontal y no apilados.
+    """
+    return (f"<span style='display:inline-flex;align-items:center;gap:.45rem;"
+            f"margin-left:.3rem;padding-left:1rem;"
+            f"border-left:1px solid rgba(128,128,128,.3)'>"
+            f"<span style='font-weight:600;white-space:nowrap'>{icon} {name}</span>"
+            f"{body}</span>")
+
+
+def _component_marks(res, vram_mb=None) -> list:
+    """Consumo de un componente: RAM, % de CPU, hilos y VRAM."""
     marks = []
     if res and res.get("rss_mb"):
         marks.append(f"{hardware.fmt_mem(res['rss_mb'])} RAM")
@@ -342,8 +360,25 @@ def _component_row(name, model, device, res, vram_mb=None) -> tuple:
             marks.append(f"{res['threads']} hilos")
     if vram_mb:
         marks.append(f"{hardware.fmt_vram(vram_mb)} VRAM")
-    where = f" · {device.upper()}" if device else ""
-    return (name, f"{model or '—'}{where}" + ("  ·  " + " · ".join(marks) if marks else ""))
+    return marks
+
+
+def _component_text(model, device, res, vram_mb=None, chosen=True) -> str:
+    """Texto de un componente: modelo, dónde corre y cuánto consume.
+
+    Si el modelo todavía no se ha elegido de verdad (`chosen=False`), no se
+    enseña ninguno: se pone «—» y el motivo, para no dejar fija una
+    suposición que parece un dato real.
+    """
+    if not chosen:
+        return "<span style='opacity:.6'>— se elegirá al empezar</span>"
+    parts = [f"<b>{model}</b>"] if model else ["<span style='opacity:.6'>—</span>"]
+    if device:
+        parts.append(f"<span style='opacity:.75'>{str(device).upper()}</span>")
+    marks = _component_marks(res, vram_mb)
+    if marks:
+        parts.append(f"<span style='opacity:.75'>{' · '.join(marks)}</span>")
+    return " <span style='opacity:.5'>·</span> ".join(parts)
 
 
 def gpu_panel_html() -> str:
@@ -414,22 +449,15 @@ def gpu_panel_html() -> str:
         vram_used = vram_total = vram_pct = 0
 
     # Qué equipo de transcripción y de análisis se ha elegido en esta ejecución.
+    # Sin ejecución no se enseña ningún modelo: se dice «—» en vez de adivinar
+    # una suposición que parecería un dato fijo.
+    chosen = bool(st)
     wdev = st.get("whisper_device") or st.get("device")
     wmodel = st.get("whisper_model")
     ldev = st.get("llm_device")
     lmodel = st.get("llm_model")
-    auto_mark = " (auto)" if st.get("whisper_model_auto") else ""
-    llm_mark = " (auto)" if st.get("llm_model_auto") else ""
-    pending = " (pendiente)"
-    if not st:
-        # Todavía no ha corrido nada: se enseña lo que se usaría con «auto».
-        info = hardware.torch_gpu_info()
-        kind = info.get("kind") or "cpu"
-        wdev = kind if kind in ("cuda", "mps") else "cpu"
-        wmodel = hardware.recommend_whisper_model(wdev, info.get("vram_mb"))
-        lmodel, _best = hardware.pick_ollama_model()
-        ldev = "GPU" if hardware.ollama_gpu_default()[0] else "CPU"
-        auto_mark = llm_mark = pending
+    w_auto = bool(st.get("whisper_model_auto"))
+    l_auto = bool(st.get("llm_model_auto"))
 
     # VRAM de la IA local: la reporta Ollama en /api/ps.
     loaded = hardware.ollama_running_models()
@@ -441,23 +469,21 @@ def gpu_panel_html() -> str:
     # La RAM de Ollama solo se muestra si tiene un modelo cargado: en reposo su
     # proceso está en memoria pero no hace nada, y solo confunde.
     ollama_res = res.get("ollama") if (running and loaded) else None
-    rows = [
-        _component_row("Whisper", f"{wmodel or '—'}{auto_mark}", wdev,
-                       res.get("whisper") if running else None,
-                       hardware.gpu_vram_of_pid(st.get("pid")) if running else 0),
-        _component_row("IA local", f"{lmodel or '—'}{llm_mark}", ldev,
-                       ollama_res, ollama_vram),
-    ]
+    whisper_res = res.get("whisper") if running else None
+    whisper_vram = hardware.gpu_vram_of_pid(st.get("pid")) if running else 0
+
+    wmark = " <span style='opacity:.6;font-size:.85em'>(auto)</span>" if w_auto else ""
+    lmark = " <span style='opacity:.6;font-size:.85em'>(auto)</span>" if l_auto else ""
+
+    # Qué está pasando ahora mismo (solo mientras hay ejecución).
     stage = st.get("stage") or ""
     batch = st.get("batch") or st.get("whisper_batch") or ""
+    now_line = ""
     if running and stage:
-        rows.insert(0, ("Ahora", " · ".join(x for x in (stage, batch) if x)))
+        now_line = ("<div style='margin-top:.35rem;font-size:.95em'>"
+                    "<span style='opacity:.7'>Ahora</span> <b>"
+                    f"{' · '.join(x for x in (stage, batch) if x)}</b></div>")
 
-    table = "".join(
-        f"<tr><td style='padding:1px 10px 1px 0;opacity:.7;white-space:nowrap'>{k}</td>"
-        f"<td style='padding:1px 0'>{v}</td></tr>"
-        for k, v in rows
-    )
     limits = (f"aviso {warn}°C · descanso {abort}°C · retoma a {resume}°C"
               if None not in (warn, abort, resume) else
               "protección por temperatura activa")
@@ -465,13 +491,14 @@ def gpu_panel_html() -> str:
         limits += f"<br><span style='color:#e8590c'>{st['gpu_rest_reason']}"
         limits += " — los lotes siguen en CPU, sin perder nada.</span>"
 
-    # Barra de equipo: CPU, RAM y VRAM del sistema entero.
+    # Fila del equipo: CPU, RAM y VRAM del sistema, y a su lado los dos
+    # componentes (Whisper e IA local) con lo que consume cada uno.
     cores = res.get("cpu_cores")
     cpu_pct = res.get("cpu_pct")
     ram_pct = res.get("ram_pct")
     sw = res.get("swap_used_mb")
-    sysline = " · ".join(x for x in (
-        _metric("CPU", f"{hardware.fmt_pct(cpu_pct)}", _load_color(cpu_pct),
+    sys_items = [
+        _metric("CPU", hardware.fmt_pct(cpu_pct), _load_color(cpu_pct),
                 _bar(cpu_pct, _load_color(cpu_pct))),
         _metric("RAM", f"{hardware.fmt_mem(res.get('ram_used_mb'))} / "
                  f"{hardware.fmt_mem(res.get('ram_total_mb'))}",
@@ -482,22 +509,34 @@ def gpu_panel_html() -> str:
         _metric("Núcleos", cores or "—"),
         _metric("Libre", hardware.fmt_mem(res.get("ram_avail_mb"))),
         _metric("Swap", hardware.fmt_mem(sw) if sw else "—"),
-    ) if x)
+    ]
+    sysline = "".join(f"<span style='white-space:nowrap'>{x}</span>"
+                      for x in sys_items if x)
+    whisper_chip = _component_chip(
+        "🎙", "Whisper",
+        _component_text(wmodel, wdev, whisper_res, whisper_vram, chosen) + wmark,
+    )
+    llm_chip = _component_chip(
+        "🤖", "IA local",
+        _component_text(lmodel, ldev, ollama_res, ollama_vram, chosen) + lmark,
+    )
 
     return f"""<div style="border:1px solid rgba(128,128,128,.25);border-radius:8px;
-  padding:.5rem .75rem;margin-bottom:.5rem;font-size:.92em;line-height:1.5">
-  <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
-    <span style="font-weight:600">🎮 GPU</span>
+  padding:.55rem .8rem;margin-bottom:.6rem;font-size:.92em;line-height:1.5">
+  <div style="display:flex;flex-wrap:wrap;gap:.4rem .9rem;align-items:center">
+    <span style="font-weight:600;white-space:nowrap">🎮 GPU</span>
     <span>{detail}</span>
-    <span style="color:{temp_color};font-weight:600">🌡 {temp}</span>
-    <span style="color:{state_color}">● {state}</span>
+    <span style="color:{temp_color};font-weight:600;white-space:nowrap">🌡 {temp}</span>
+    <span style="color:{state_color};white-space:nowrap">● {state}</span>
     <span style="opacity:.6;font-size:.85em">{limits}</span>
   </div>
-  <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-top:.3rem;
-    padding-top:.3rem;border-top:1px solid rgba(128,128,128,.18)">
+  <div style="display:flex;flex-wrap:wrap;gap:.35rem 1.1rem;align-items:center;
+    margin-top:.4rem;padding-top:.4rem;border-top:1px solid rgba(128,128,128,.18)">
     {sysline}
+    {whisper_chip}
+    {llm_chip}
   </div>
-  <table style="border-collapse:collapse;margin-top:.25rem">{table}</table>
+  {now_line}
 </div>"""
 
 
@@ -519,7 +558,7 @@ def _new_process_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def _run_cli_streaming(args, key="video", env=None):
+def _run_cli_streaming(args, key="video", env=None, preamble=""):
     """Run the CLI and stream its log lines (stderr) to the UI."""
     proc = subprocess.Popen(
         [_PY, _CLI] + args,
@@ -533,9 +572,11 @@ def _run_cli_streaming(args, key="video", env=None):
         **_new_process_kwargs(),
     )
     _RUNNER[key] = proc
-    lines = []
+    # `preamble` va la primera: el log se reescribe entero en cada yield, así
+    # que si no se sembrara aquí la línea se perdería al primer "Iniciando…".
+    lines = [preamble] if preamble else []
     try:
-        yield ("Iniciando...", "")
+        yield ("\n".join(lines + ["Iniciando..."]), "")
         while True:
             line = proc.stderr.readline()
             if line:
@@ -680,6 +721,32 @@ def pick_directory() -> str:
 # ---------------------------------------------------------------------------
 # Tab 1: Video / URL
 # ---------------------------------------------------------------------------
+def _describe_path(path) -> str:
+    """El formato REAL del archivo de la ruta, leído por ffprobe.
+
+    No se fía de la extensión (miente bastante). Si el archivo no existe o
+    ffprobe no dice nada, lo dice con claridad en vez de inventar un formato.
+    """
+    path = (path or "").strip().strip('"').strip("'")
+    if not path:
+        return "_Escribe una ruta y se ve aquí el formato real._"
+    try:
+        info = video_to_md.describe_media(path)
+    except Exception as exc:                    # ffprobe ausente, ruta con
+        return f"⚠️ No se ha podido leer el archivo: {exc}"  # tildes raras…
+
+    if not info["exists"]:
+        return f"⚠️ No existe el archivo: `{info['path']}`"
+
+    fmt = video_to_md.fmt_media(info)
+    if info["kind"] == "audio":
+        return (f"🎙 **Solo audio** — {fmt}\n\n"
+                "Se transcribe igual, pero no se sacarán frames (no hay imagen).")
+    if info["kind"] == "video":
+        return f"🎬 **Con video** — {fmt}"
+    return f"⚠️ {fmt}"
+
+
 def on_run_video(
     file_in, path_in, url_in, outdir, device, model, interval,
     autoclean, llm_m, no_llm, extract_frames_cb, cookies_browser, cookies_file,
@@ -688,9 +755,14 @@ def on_run_video(
     outdir = (outdir or _DEFAULT_OUTDIR).strip()
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
+    # Fuentes admitidas, en orden de prioridad: URL, archivo subido y ruta
+    # local. Un mismo campo para video y audio: el código deduce cuál es
+    # leyendo el archivo (ffprobe), no la extensión.
     video_arg = None
+    es_url = False
     if url_in and url_in.strip():
         video_arg = url_in.strip()
+        es_url = True
     elif file_in:
         src = file_in[0] if isinstance(file_in, list) else file_in
         video_arg = str(src)
@@ -698,7 +770,25 @@ def on_run_video(
         video_arg = path_in.strip()
 
     if not video_arg:
-        return ("Elige un video local (subir o ruta) o pega una URL.", "")
+        # `yield`, no `return`: la función es generadora (delega con
+        # `yield from`), así que un `return` aquí terminaría sin llegar a
+        # escribir nada y el usuario no vería ni el error ni el motivo.
+        yield ("Elige un archivo local (video o audio, subido o por ruta) "
+               "o pega una URL.", "")
+        return
+
+    # Si es un archivo local, se dice de entrada qué formato tiene: así el
+    # log deja claro qué se eligió sin tener que esperar a los pasos siguientes.
+    preamble = ""
+    if not es_url and not video_arg.lower().startswith(("http://", "https://")):
+        try:
+            info = video_to_md.describe_media(video_arg)
+            if info["exists"]:
+                etiqueta = "solo audio" if info["kind"] == "audio" else "video"
+                preamble = (f"[FUENTE] {Path(video_arg).name} · {etiqueta} · "
+                            f"{video_to_md.fmt_media(info)}")
+        except Exception:
+            preamble = ""
 
     _clear_status()
     args = [
@@ -720,7 +810,8 @@ def on_run_video(
         args += ["--cookies", cookies_file.strip()]
 
     yield from _run_cli_streaming(
-        args, key="video", env=_ollama_env(llm_use_gpu, llm_gpu_sel)
+        args, key="video", env=_ollama_env(llm_use_gpu, llm_gpu_sel),
+        preamble=preamble,
     )
 
 
@@ -818,18 +909,35 @@ def build_app() -> gr.Blocks:
         # Panel de equipo: qué GPU hay, su temperatura y si se está usando.
         gpu_panel = gr.HTML(gpu_panel_html())
         with gr.Tab("Video / URL"):
-            with gr.Row():
+            # ── Origen del material ─────────────────────────────────────
+            # Un solo panel a todo el ancho de la pestaña: dentro van, en
+            # orden, la subida del archivo, la ruta local y la URL. Se usa
+            # `gr.Column` (no `gr.Row`) a propósito: dentro de una fila
+            # Gradio reparte el ancho entre las columnas y el panel se
+            # quedaría estrecho; así ocupa el 100 % respetando el padding
+            # que ya pone la página. `variant="panel"` es el contenedor que
+            # trae borde, fondo y radio del tema (claro y oscuro).
+            with gr.Column(variant="panel", elem_id="av_origen"):
                 file_in = gr.File(
                     # Sin lista de extensiones: se acepta cualquier formato
-                    # (video, audio o contenedor raro) y ffmpeg decide.
-                    label="Video o audio local (opcional)",
+                    # (video, audio o contenedor raro) y ffprobe decide.
+                    label="Subir archivo",
                 )
-                with gr.Column():
-                    path_in = gr.Textbox(label="…o ruta del video local")
-                    url_in = gr.Textbox(
-                        label="…o URL (YouTube/plataforma)",
-                        placeholder="https://…",
-                    )
+                # Un solo campo de ruta para video y audio: el formato lo pone
+                # el código (ffprobe) al escribirla, no el usuario ni la
+                # extensión del archivo.
+                path_in = gr.Textbox(
+                    label="Video o audio local (cualquier formato)",
+                    info="Debajo se ve el formato real detectado; si es solo "
+                         "audio no habrá frames.",
+                )
+                url_in = gr.Textbox(
+                    label="URL (YouTube, Drive, cualquier plataforma)",
+                    placeholder="https://…",
+                )
+                src_info = gr.Markdown(
+                    "_Escribe una ruta y se ve aquí el formato real._"
+                )
             with gr.Row():
                 outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta de salida (informe + frames)")
                 outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
@@ -869,6 +977,12 @@ def build_app() -> gr.Blocks:
                 outputs=[status],
             )
             outdir_btn.click(pick_directory, outputs=[outdir])
+            # El formato se lee del archivo, no de la extensión: se avisa en
+            # cuanto se escribe la ruta o se sube el archivo.
+            path_in.change(_describe_path, inputs=path_in, outputs=src_info,
+                           show_progress="hidden")
+            file_in.change(_describe_path, inputs=file_in, outputs=src_info,
+                           show_progress="hidden")
             llm_refresh.click(_refresh_models, outputs=[llm_m])
             llm_gpu_refresh.click(
                 lambda: gr.update(choices=list_gpu_indices()), outputs=[llm_gpu_sel]
@@ -1009,6 +1123,32 @@ gradio-app {
 </style>"""
 
 
+# Cada grupo de la interfaz va dentro de un `gr.Column(variant="panel",
+# elem_id="av_<seccion>")`, que ya trae borde, fondo y radio del tema (claro y
+# oscuro). Aquí solo se ajusta el relleno del panel y se permite que sus hijos
+# se encogan.
+#
+# DENTRO del área de subida no se toca nada: se deja el aspecto que trae
+# Gradio (los 240 px de alto y los textos en tres líneas). Se probó a
+# compactarlo y a juntarlos en una sola línea, pero en un contenedor
+# `display:flex` cada trozo de texto y el `<span class="or">` son items flex
+# distintos, así que juntarlos exige rehacer la maqueta del widget; no merece
+# la pena para un campo que ya funciona.
+_LAYOUT_CSS = """<style>
+#av_origen {
+  padding: .75rem 1rem .9rem !important;
+  margin-bottom: .55rem !important;
+  gap: .45rem !important;
+}
+/* A todo el ancho de la pestaña: los hijos pueden encogerse. Sin esto, el
+   ancho mínimo de los campos empuja al panel y el texto se parte en dos
+   líneas. */
+#av_origen > * {
+  min-width: 0 !important;
+}
+</style>"""
+
+
 def _brand_header() -> gr.Markdown:
     return gr.Markdown(
         """<div style="text-align:center;line-height:1.25;">
@@ -1041,7 +1181,7 @@ def main() -> int:
         server_port=args.port,
         inbrowser=False,
         share=bool(args.share),
-        head=_FOOTER_CSS,
+        head=_FOOTER_CSS + _LAYOUT_CSS,
     )
     return 0
 
