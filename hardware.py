@@ -34,6 +34,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 _GPU_CACHE = {"ts": 0.0, "gpus": []}
 _GPU_CACHE_LOCK = threading.Lock()
 _GPU_CACHE_TTL = 1.0  # segundos
+# Los procesos en la GPU se cachean aparte (otra llamada a nvidia-smi).
+_GPU_PROC_CACHE = {"ts": 0.0, "procs": None}
+_GPU_PROC_CACHE_LOCK = threading.Lock()
 
 _NVIDIA_FIELDS = (
     "index,name,memory.total,memory.used,temperature.gpu,"
@@ -96,10 +99,16 @@ WHISPER_CHOICES = ("auto", "tiny", "base", "small", "medium", "large",
 # Utilidades
 # ---------------------------------------------------------------------------
 def _run(cmd, timeout: float = 5.0):
-    """subprocess.run que nunca lanza (devuelve None si falla)."""
+    """subprocess.run que nunca lanza (devuelve None si falla).
+
+    `encoding` explícito porque en Windows el texto se decodifica con la
+    codificación de la consola (cp1252/cp850) y un nombre de tarjeta o de
+    archivo con acento o emoji lanza UnicodeDecodeError.
+    """
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
         )
     except Exception:
         return None
@@ -191,6 +200,47 @@ def gpu_free_mb(gpu: dict) -> int:
     if not gpu:
         return 0
     return max(0, (gpu.get("vram_total_mb") or 0) - (gpu.get("vram_used_mb") or 0))
+
+
+def gpu_compute_processes(max_age: float = _GPU_CACHE_TTL) -> list:
+    """Procesos que están usando la GPU ahora mismo.
+
+    [{pid, name, vram_mb}] — lista vacía si nvidia-smi no lo soporta o no hay
+    nada en la GPU. Sirve para atribuir la VRAM a Whisper o a la IA local.
+    """
+    with _GPU_PROC_CACHE_LOCK:
+        if (time.time() - _GPU_PROC_CACHE["ts"] < max_age
+                and _GPU_PROC_CACHE["procs"] is not None):
+            return _GPU_PROC_CACHE["procs"]
+
+    out = _run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits"])
+    procs = []
+    if out is not None and out.returncode == 0:
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3 or not parts[0].isdigit():
+                continue
+            procs.append({
+                "pid": int(parts[0]),
+                "name": parts[1] or "?",
+                "vram_mb": int(float(parts[2])) if _is_num(parts[2]) else 0,
+            })
+
+    with _GPU_PROC_CACHE_LOCK:
+        _GPU_PROC_CACHE["ts"] = time.time()
+        _GPU_PROC_CACHE["procs"] = procs
+    return procs
+
+
+def gpu_vram_of_pid(pid, max_age: float = _GPU_CACHE_TTL):
+    """MB de VRAM que usa un PID concreto, o 0 si no está en la GPU."""
+    if not pid:
+        return 0
+    for p in gpu_compute_processes(max_age=max_age):
+        if p["pid"] == int(pid):
+            return p["vram_mb"]
+    return 0
 
 
 def primary_gpu(gpus: list = None) -> dict:
@@ -399,9 +449,10 @@ def recommend_whisper_model(device: str = "cpu", vram_mb: int = None,
                             duration_s: float = None) -> str:
     """Modelo de Whisper adecuado al equipo y a la duración del audio.
 
-    GPU: el mayor que quepa en ~75% de la VRAM. CPU: `small` para audios
-    cortos, `base` para medias y `tiny` para horas (en CPU la diferencia de
-    tiempo es enorme).
+    GPU: el mayor que quepa en ~75% de la VRAM. MPS (Mac Apple Silicon): la
+    memoria es compartida con la CPU y se estima por los GB de RAM. CPU:
+    `small` para audios cortos, `base` para medias y `tiny` para horas (en CPU
+    la diferencia de tiempo es enorme).
     """
     if str(device).startswith("cuda"):
         vram = vram_mb
@@ -412,6 +463,15 @@ def recommend_whisper_model(device: str = "cpu", vram_mb: int = None,
             if need <= budget:
                 return name
         return "tiny"
+    if str(device).startswith("mps"):
+        # Memoria unificada con la CPU: se es conservador (25% de la RAM) y no
+        # se pasa de `medium`, porque en MPS los modelos grandes van tan solos
+        # que acabaría paginandose con swap. Para audio largo, mejor en CPU.
+        budget = max(1.0, _system_ram_gb() * 0.25)
+        for name, need in reversed(WHISPER_VRAM_GB):
+            if need <= budget and name in ("tiny", "base", "small", "medium"):
+                return name
+        return "small"
     mins = (duration_s or 0) / 60.0
     if not duration_s:
         return "small"
@@ -420,6 +480,67 @@ def recommend_whisper_model(device: str = "cpu", vram_mb: int = None,
     if mins <= 45:
         return "base"
     return "tiny"
+
+
+def _system_ram_gb() -> float:
+    """RAM del sistema en GB (0 si no se puede saber)."""
+    if psutil is not None:
+        try:
+            return psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            pass
+    try:  # /proc/meminfo en Linux
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def torch_mps_info() -> dict:
+    """GPU de Apple (Metal Performance Shaders) vista por PyTorch.
+
+    En macOS no hay nvidia-smi ni CUDA: sin esto, un Mac con chip Apple
+    Silicon mandaría Whisper a CPU, que es 5-10x más lento.
+    """
+    info = {"available": False, "usable": False, "name": None,
+            "vram_mb": 0, "reason": ""}
+    try:
+        import torch
+    except Exception as exc:
+        info["reason"] = f"torch no instalado ({exc.__class__.__name__})"
+        return info
+    try:
+        mps = getattr(torch.backends, "mps", None)
+        if mps is None or not mps.is_available():
+            info["reason"] = "MPS no disponible en este equipo"
+            return info
+        info["available"] = True
+        info["name"] = "Apple GPU (Metal)"
+        info["usable"] = bool(mps.is_built() and mps.is_available())
+        # Memoria unificada: se usa la RAM del sistema como aproximación.
+        info["vram_mb"] = int(_system_ram_gb() * 1024)
+        if not info["usable"]:
+            info["reason"] = "MPS compilado pero no disponible"
+    except Exception as exc:
+        info["reason"] = f"no se pudo consultar MPS ({exc})"
+    return info
+
+
+def torch_gpu_info() -> dict:
+    """Qué GPU puede usar PyTorch en este equipo: CUDA si la hay, si no MPS.
+
+    Devuelve el mismo formato que `torch_cuda_info`, con `kind` a modo de
+    'cuda' o 'mps', para no tener dos caminos en el código que llama.
+    """
+    cuda = torch_cuda_info()
+    if cuda.get("usable"):
+        return dict(cuda, kind="cuda")
+    mps = torch_mps_info()
+    if mps.get("usable"):
+        return dict(mps, kind="mps")
+    return dict(cuda if cuda.get("available") else mps, kind="cpu")
 
 
 def whisper_report(device: str = "cpu", vram_mb: int = None,
@@ -518,3 +639,218 @@ def log_lines() -> list:
             + (f" — {tc['reason']}" if tc.get("reason") else "")
         )
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Consumo de CPU/RAM del equipo y de cada componente (Whisper, IA local)
+# ---------------------------------------------------------------------------
+# El panel de la GUI se refresca cada 2 s: estas lecturas se cachean un par de
+# segundos para no ir a /proc ni a nvidia-smi en cada tick.
+_RES_CACHE = {"ts": 0.0, "data": None}
+_RES_LOCK = threading.Lock()
+_RES_TTL = 1.5  # segundos
+
+try:  # psutil es opcional: sin él el panel funciona igual, sin cifras
+    import psutil
+except Exception:  # pragma: no cover
+    psutil = None
+
+
+def _mb(num_bytes) -> float:
+    return round((num_bytes or 0) / (1024 * 1024), 1)
+
+
+def fmt_mem(mb) -> str:
+    """Bytes en MB o GB según el tamaño: 512.0 -> '512 MB', 6144 -> '6.0 GB'.
+
+    Para la RAM del equipo, donde los procesos usan fracciones de GB y siempre
+    se muestran en MB (a diferencia de `fmt_vram`, pensada para VRAM).
+    """
+    if not mb:
+        return "—"
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB".replace(".0 ", " ")
+    return f"{mb:.0f} MB"
+
+
+def fmt_pct(value) -> str:
+    """Porcentaje redondeado, o «—» si no se pudo medir."""
+    if value is None:
+        return "—"
+    return f"{value:.0f} %"
+
+
+def _find_pids(names) -> list:
+    """PIDs cuyo nombre de proceso empieza por alguno de `names`.
+
+    Se busca con psutil (funciona igual en Windows, macOS y Linux) y, si no
+    está, se recurre a /proc, que solo existe en Linux.
+    """
+    if psutil is not None:
+        found = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                comm = (proc.info.get("name") or "")
+            except Exception:
+                continue
+            if any(comm == n or comm.startswith(n) for n in names):
+                found.append(proc.info["pid"])
+        return found
+
+    found = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return found  # sin /proc (Windows/macOS) y sin psutil: no hay datos
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        if any(comm == n or comm.startswith(n) for n in names):
+            found.append(int(entry.name))
+    return found
+
+
+def _snapshot_uncached(cli_pid=None) -> dict:
+    """Mide CPU/RAM del equipo, del proceso de transcripción y del de Ollama."""
+    snap = {
+        "cpu_pct": None, "cpu_cores": os.cpu_count(),
+        "load1": None,
+        "ram_total_mb": None, "ram_used_mb": None, "ram_avail_mb": None,
+        "ram_pct": None, "swap_used_mb": None,
+        "whisper": None, "ollama": None,
+    }
+    if psutil is None:
+        return snap
+
+    try:
+        snap["cpu_pct"] = float(psutil.cpu_percent(interval=None))
+        snap["cpu_cores"] = psutil.cpu_count() or snap["cpu_cores"]
+    except Exception:
+        pass
+    try:
+        snap["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass
+    try:
+        vm = psutil.virtual_memory()
+        snap["ram_total_mb"] = _mb(vm.total)
+        snap["ram_used_mb"] = _mb(getattr(vm, "used", None) or (vm.total - vm.available))
+        snap["ram_avail_mb"] = _mb(vm.available)
+        snap["ram_pct"] = float(vm.percent)
+        sw = psutil.swap_memory()
+        snap["swap_used_mb"] = _mb(getattr(sw, "used", 0))
+    except Exception:
+        pass
+
+    # Whisper: el proceso del CLI (la GUI escribe su pid en el estado).
+    if cli_pid:
+        try:
+            proc = psutil.Process(int(cli_pid))
+            with proc.oneshot():
+                mem = proc.memory_info()
+                snap["whisper"] = {
+                    "pid": int(cli_pid),
+                    "rss_mb": _mb(mem.rss),
+                    "vms_mb": _mb(mem.vms),
+                    "threads": proc.num_threads(),
+                    "cpu_pct": _proc_cpu_pct(proc),
+                }
+        except Exception:
+            snap["whisper"] = None
+
+    # IA local: el/los procesos de Ollama.
+    pids = _ollama_pids()
+    if pids:
+        rss = vms = 0.0
+        cpu = 0.0
+        threads = 0
+        for pid in pids:
+            try:
+                proc = psutil.Process(pid)
+                with proc.oneshot():
+                    mem = proc.memory_info()
+                    rss += mem.rss
+                    vms += mem.vms
+                    threads += proc.num_threads()
+                    cpu += _proc_cpu_pct(proc)
+            except Exception:
+                continue
+        snap["ollama"] = {"pid": pids[0], "pids": pids, "rss_mb": _mb(rss),
+                          "vms_mb": _mb(vms), "threads": threads,
+                          "cpu_pct": round(cpu, 1)}
+    return snap
+
+
+_PROC_CPU = {"last": {}}
+
+
+def _proc_cpu_pct(proc) -> float:
+    """% de CPU de un proceso respecto a UN núcleo (puede pasar de 100)."""
+    pid = proc.pid
+    try:
+        with proc.oneshot():
+            times = proc.cpu_times()
+    except Exception:
+        return 0.0
+    now = time.time()
+    cpu_now = (times.user or 0.0) + (times.system or 0.0)
+    prev = _PROC_CPU["last"].get(pid)
+    _PROC_CPU["last"][pid] = (now, cpu_now)
+    if len(_PROC_CPU["last"]) > 64:  # poda de PIDs ya terminados
+        _PROC_CPU["last"] = {p: v for p, v in _PROC_CPU["last"].items()
+                             if now - v[0] < 60}
+    if not prev or now - prev[0] < 0.2:
+        return 0.0
+    delta_cpu = cpu_now - prev[1]
+    delta_t = now - prev[0]
+    if delta_t <= 0:
+        return 0.0
+    return max(0.0, delta_cpu / delta_t * 100.0)
+
+
+def _ollama_pids() -> list:
+    """PIDs de los procesos de Ollama (varios: servidor + runner)."""
+    return _find_pids(["ollama"])
+
+
+def ollama_running_models() -> list:
+    """Modelos cargados ahora mismo en Ollama (`/api/ps`).
+
+    [{name, size_vram_mb, vram_pct}] — lista vacía si Ollama no está en marcha.
+    """
+    out = []
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return out
+    for m in (data or {}).get("models") or []:
+        size_vram = m.get("size_vram") or 0
+        out.append({
+            "name": m.get("name") or m.get("model") or "?",
+            "size_vram_mb": int(size_vram // (1024 * 1024)) if size_vram else 0,
+            "vram_pct": int(m.get("size_vram_percent") or 0),
+        })
+    return out
+
+
+def resource_snapshot(cli_pid=None, max_age: float = _RES_TTL) -> dict:
+    """Consumo actual de CPU/RAM del equipo y de cada componente.
+
+    `cli_pid` es el proceso del CLI (transcripción con Whisper). Se cachea
+    `max_age` segundos porque el panel de la GUI pregunta cada 2 s.
+    """
+    with _RES_LOCK:
+        if (_RES_CACHE["data"] is not None
+                and time.time() - _RES_CACHE["ts"] < max_age):
+            return _RES_CACHE["data"]
+    data = _snapshot_uncached(cli_pid)
+    with _RES_LOCK:
+        _RES_CACHE["ts"] = time.time()
+        _RES_CACHE["data"] = data
+    return data

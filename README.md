@@ -8,11 +8,36 @@ Herramienta que convierte un video en un informe Markdown estructurado:
 
 ## Requisitos
 
-- `ffmpeg` instalado (extracción de audio y frames)
+- Python 3.10+ y `ffmpeg` en el PATH (extracción de audio y frames)
 - `ollama` corriendo en `http://localhost:11434` (para el análisis de ideas)
 - Al menos un modelo descargado en Ollama (`ollama pull qwen3.5:4b` o el que
   prefieras). **No hace falta saber cuál**: con `--llm auto` (por defecto) se
   detectan los tuyos y se elige el mejor que quepa en tu equipo.
+
+### Sistemas operativos
+
+Funciona en **Linux, Windows y macOS**. Lo que cambia según el sistema:
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| GPU para Whisper | CUDA si el torch la soporta | CUDA | **MPS** (chip Apple Silicon), automática |
+| GPU del panel | `nvidia-smi` | `nvidia-smi` | la de Apple; sin temperatura ni VRAM |
+| Audio de reuniones | PipeWire/PulseAudio | DirectShow | AVFoundation |
+| Instalación | `instalar.sh` | `instalar.bat` | `instalar.sh` (con Homebrew para ffmpeg) |
+| Arranque de la GUI | `start_gui.sh` | `iniciar_gui.bat` | `start_gui.sh` |
+
+Detalles que importan:
+
+- **Windows**: usa doble clic en `instalar.bat` y luego `iniciar_gui.bat`. No
+  hace falta instalar `yt-dlp` a mano (se instala con el resto en el venv).
+  Para las reuniones en vivo necesitas un dispositivo de audio que ffmpeg
+  pueda abrir; `--list-sources` muestra los nombres exactos.
+- **macOS**: `brew install ffmpeg`. En los Mac con chip Apple Silicon Whisper
+  corre en la GPU (Metal) sin tocar nada. En la reunión en vivo, el nombre de
+  la fuente debe ser el de un **dispositivo de entrada de audio** (no la
+  cámara).
+- Si `psutil` no está instalado, todo funciona igual: el panel solo pierde las
+  cifras de CPU/RAM por proceso.
 
 ## Instalación
 
@@ -23,6 +48,9 @@ python3 -m venv venv
 # 2. Instalar dependencias
 ./venv/bin/pip install -r requirements.txt
 ```
+
+En Windows, `instalar.bat` hace los dos pasos (y `iniciar_gui.bat` arranca la
+interfaz).
 
 ## Uso
 
@@ -222,11 +250,22 @@ Tiene tres pestañas:
   captura, ves la transcripción en tiempo real, la detienes con un botón y
   generas los apuntes automáticamente.
 
-Encima de las pestañas hay un **panel de GPU** que se actualiza cada 2 s:
-nombre de la tarjeta, VRAM libre, temperatura (verde/naranja/rojo según los
-umbrales) y un indicador de estado —`en uso`, `en descanso`, `libre` o
-`no detectada`— para saber si la GPU está trabajando o no. Además indica qué
-modelo de Whisper y de IA local se han elegido y en qué device corren.
+Encima de las pestañas hay un **panel de equipo** que se actualiza cada 2 s:
+
+- **GPU**: nombre de la tarjeta, VRAM libre, temperatura (verde/naranja/rojo
+  según los umbrales) y un indicador de estado —`en uso`, `en descanso`, `libre`
+  o `no detectada`— para saber si la GPU está trabajando o no.
+- **Barra de sistema**: consumo de CPU, RAM y VRAM con barrita de progreso
+  (verde < 60 %, naranja hasta 85 %, rojo por encima), más núcleos, RAM libre y
+  swap.
+- **Por componente**: qué modelo de Whisper y de IA local se han elegido, en qué
+  device corren y cuánta RAM y CPU consume cada uno en este momento (`%` de CPU
+  por proceso, como en `top`; puede pasar de 100 con varios núcleos), más la
+  VRAM que reserva cada uno.
+
+El consumo se mide con `psutil` (procesos) y con la API de Ollama (`/api/ps`,
+para la VRAM del modelo). Si `psutil` no está instalado, el panel sigue
+funcionando: solo se pierden las cifras de CPU/RAM.
 
 La interfaz ejecuta los mismos scripts (`video_to_md.py` y
 `live_meeting.py`), así que no hay lógica duplicada.
@@ -298,8 +337,9 @@ a mitad de la ejecución**. Para evitarlo la herramienta:
 - Guarda la transcripción (`_transcripcion.txt`) y un **informe parcial** con
   transcripción + frames ANTES de empezar el análisis con Ollama, para no
   perder progreso si el equipo se apaga.
-- La GUI lo enseña todo en el panel de GPU: temperatura, si la tarjeta está en
-  descanso y por qué, y en qué device corre cada cosa.
+- La GUI lo enseña todo en el panel de equipo: temperatura, si la tarjeta está en
+  descanso y por qué, en qué device corre cada cosa y cuánta CPU/RAM/VRAM está
+  usando cada componente.
 - Contexto de Ollama ajustado al equipo (4096 tokens, 8192 si hay VRAM de
   sobra) en vez de 8192 fijos.
 

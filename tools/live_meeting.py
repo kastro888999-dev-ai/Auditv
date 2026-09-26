@@ -29,6 +29,8 @@ apuntes report is generated automatically.
 
 import argparse
 import datetime
+import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,23 +62,104 @@ MAX_CHARS = 8000         # cap fed to the notes analyzer
 GPU_CHECK_EVERY = 10     # chunks (~40 s)
 
 
+def _ffmpeg_cmd() -> list:
+    """Ruta de ffmpeg: la del PATH o, si no está, la del venv del proyecto.
+
+    En Windows ffmpeg suele instalarse aparte y los ejecutables de pip caen en
+    `venv\\Scripts`, que no está en el PATH si la GUI se abre con doble clic.
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return [found]
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for cand in (Path(sys.executable).parent / name,
+                 _PROJECT_ROOT / "venv" / ("Scripts" if os.name == "nt" else "bin") / name):
+        if cand.exists():
+            return [str(cand)]
+    return ["ffmpeg"]
+
+
+def _audio_backend() -> str:
+    """Backend de captura de audio de ffmpeg para este sistema.
+
+    Linux usa PulseAudio/PipeWire (`pulse`), Windows DirectShow (`dshow`) y
+    macOS AVFoundation. Se fuerza con AUDITV_AUDIO_BACKEND.
+    """
+    forced = (os.environ.get("AUDITV_AUDIO_BACKEND") or "").strip().lower()
+    if forced in ("pulse", "dshow", "avfoundation", "wasapi"):
+        return forced
+    if sys.platform.startswith("win"):
+        return "dshow"
+    if sys.platform == "darwin":
+        return "avfoundation"
+    return "pulse"
+
+
 def list_sources() -> list:
-    """Return PipeWire/PulseAudio sink/mic sources via pactl, if available."""
+    """Fuentes de audio disponibles, según el backend del sistema.
+
+    En Linux, sinks/mics de PipeWire/PulseAudio vía `pactl`; en Windows y macOS
+    se leen de ffmpeg, que es quien las captura.
+    """
+    backend = _audio_backend()
+    if backend == "pulse":
+        try:
+            out = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5,
+            )
+            if out.returncode == 0:
+                return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        except Exception:
+            pass
+        return []
+
+    if backend == "dshow":
+        probe = ["ffmpeg", "-hide_banner", "-list_devices", "true",
+                 "-f", "dshow", "-i", "dummy"]
+    else:  # avfoundation
+        probe = ["ffmpeg", "-hide_banner", "-f", "avfoundation",
+                 "-list_devices", "true", "-i", ""]
     try:
+        # ffmpeg lista los dispositivos en stderr y sale con código 1.
         out = subprocess.run(
-            ["pactl", "list", "short", "sources"],
-            capture_output=True, text=True, timeout=5,
+            probe, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10,
         )
-        if out.returncode == 0:
-            return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        raw = (out.stderr or "") + "\n" + (out.stdout or "")
     except Exception:
-        pass
-    return []
+        return []
+
+    devices = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if backend == "dshow":
+            # `  " stereo mix (Realtek(R) Audio)` -> solo dispositivos de audio.
+            if line.startswith('"') and "audio" in line.lower() and '"' in line:
+                name = line.split('"')[1]
+                if name:
+                    devices.append(name)
+        else:  # avfoundation: "[0] Built-in Microphone"
+            if line.startswith("[") and "]" in line:
+                name = line.split("]", 1)[1].strip()
+                if name:
+                    devices.append(name)
+    return devices
 
 
 def pick_source(source: str) -> str:
     """Resolve the audio source name (auto => prefer system monitor)."""
     if source not in ("auto", "default", ""):
+        return source
+    backend = _audio_backend()
+    if backend != "pulse":
+        # En Windows/macOS no hay "monitor" del sistema con este nombre: se usa
+        # el primer dispositivo de entrada que exista.
+        sources = list_sources()
+        if sources:
+            log(f"Fuente de audio: {sources[0]}", "AUDIO")
+            return sources[0]
         return source
     sources = list_sources()
     for ln in sources:
@@ -85,6 +168,24 @@ def pick_source(source: str) -> str:
             log(f"Fuente de audio de sistema: {name}", "AUDIO")
             return name
     return "default"
+
+
+def ffmpeg_input_args(source: str) -> list:
+    """Argumentos de entrada de ffmpeg para la fuente elegida."""
+    backend = _audio_backend()
+    if backend == "dshow":
+        return ["-f", "dshow", "-i", f"audio={source}"]
+    if backend == "avfoundation":
+        # avfoundation espera "índice:nombre" y el audio de sistema (mezcla) es 0.
+        if source and not source.startswith(":"):
+            idx = "0"
+            for line in list_sources():
+                if line == source:
+                    idx = str(list_sources().index(source))
+                    break
+            return ["-f", "avfoundation", "-i", f"{idx}:{source}"]
+        return ["-f", "avfoundation", "-i", f"0:{source}"]
+    return ["-f", "pulse", "-i", source]
 
 
 def rms_int16(data: np.ndarray) -> float:
@@ -108,7 +209,7 @@ def main(argv=None) -> int:
                         help="Modelo Whisper: auto (default, elige según tu "
                              "equipo) o tiny/base/small/medium/large")
     parser.add_argument("--language", default="es", help="Idioma (default: es)")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"),
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"),
                         default="auto",
                         help="Device de Whisper: auto (default, usa la GPU solo "
                              "si el equipo y la temperatura lo permiten), cpu "
@@ -157,8 +258,8 @@ def main(argv=None) -> int:
     model = whisper.load_model(model_name, device=device)
 
     ffmpeg_cmd = [
-        "ffmpeg", "-loglevel", "error", "-nostdin",
-        "-f", "pulse", "-i", src,
+        *_ffmpeg_cmd(), "-loglevel", "error", "-nostdin",
+        *ffmpeg_input_args(src),
         "-ac", "1", "-ar", str(SAMPLE_RATE),
         "-f", "s16le", "pipe:1",
     ]
@@ -170,6 +271,11 @@ def main(argv=None) -> int:
         stop["flag"] = True
 
     signal.signal(signal.SIGINT, _on_sigint)
+    if hasattr(signal, "SIGBREAK"):
+        # En Windows la GUI para la captura con CTRL_BREAK_EVENT, que en el
+        # hijo es SIGBREAK. Sin este handler, el CRT mata el proceso y no se
+        # escribe el log final ni se genera el informe.
+        signal.signal(signal.SIGBREAK, _on_sigint)
 
     def ts_now() -> str:
         elapsed = (datetime.datetime.now() - started).total_seconds()
@@ -187,7 +293,10 @@ def main(argv=None) -> int:
 
     proc = subprocess.Popen(
         ffmpeg_cmd, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, bufsize=1 << 20,
+        # stderr a un pipe (y no a DEVNULL) para poder explicar el fallo si
+        # ffmpeg no encuentra el dispositivo: si no, el bucle termina con 0
+        # segmentos y parece una reunión en silencio.
+        stderr=subprocess.PIPE, bufsize=1 << 20,
     )
 
     segment_count = 0
@@ -202,6 +311,16 @@ def main(argv=None) -> int:
             while not stop["flag"]:
                 raw = proc.stdout.read(4096)
                 if not raw:
+                    # ffmpeg se ha terminado: o se paró a propósito o falló.
+                    if not stop["flag"] and proc.poll() not in (None, 0):
+                        err = ""
+                        try:
+                            err = (proc.stderr.read() or b"").decode(
+                                "utf-8", "replace").strip()
+                        except Exception:
+                            pass
+                        log("ffmpeg terminó con error "
+                            f"({proc.returncode}). {err}", "ERROR")
                     break
                 buffer = np.concatenate(
                     [buffer, np.frombuffer(raw, dtype=np.int16)]
@@ -261,6 +380,12 @@ def main(argv=None) -> int:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    if segment_count == 0 and not stop["flag"]:
+        # ffmpeg murió antes de dar audio (mic inexistente, sin loopback...).
+        log(f"No se capturó audio de '{src}'. Revisa la fuente con "
+            f"--list-sources; en Windows/macOS el nombre debe ser el del "
+            f"dispositivo de entrada.", "ERROR")
 
     log(
         f"Transcripción guardada: {txt_path} ({segment_count} segmentos, "

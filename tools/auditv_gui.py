@@ -33,7 +33,28 @@ from pathlib import Path
 import gradio as gr
 
 _PROJECT = Path(__file__).resolve().parent.parent
-_PY = str(_PROJECT / "venv" / "bin" / "python")
+
+
+def _venv_python() -> str:
+    """Intérprete del venv del proyecto, según el sistema.
+
+    En Windows el venv usa `venv\\Scripts\\python.exe`, no `venv/bin/python`.
+    Si no existe (alguien lo lanzó con su propio Python), se usa el
+    intérprete actual, que es lo que hay.
+    """
+    if os.name == "nt":
+        candidates = [_PROJECT / "venv" / "Scripts" / "python.exe",
+                      _PROJECT / "venv" / "bin" / "python"]
+    else:
+        candidates = [_PROJECT / "venv" / "bin" / "python",
+                      _PROJECT / "venv" / "Scripts" / "python.exe"]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return sys.executable
+
+
+_PY = _venv_python()
 _CLI = str(_PROJECT / "video_to_md.py")
 _LIVE_SCRIPT = str(_PROJECT / "tools" / "live_meeting.py")
 
@@ -105,13 +126,25 @@ def _autoscroll_js(n_inputs: int) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 def _terminate(proc) -> None:
-    """Termina el proceso y su grupo (ffmpeg/yt-dlp incluidos)."""
+    """Termina el proceso y su grupo (ffmpeg/yt-dlp incluidos).
+
+    `os.killpg`/`os.getpgid` solo existen en POSIX; en Windows se cae a
+    `terminate()`/`kill()`, que no llegan a los hijos de ffmpeg.
+    """
     if proc is None or proc.poll() is not None:
         return
-    pgid = os.getpgid(proc.pid)
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except (AttributeError, OSError, ProcessLookupError):
+    pgid = None
+    if hasattr(os, "getpgid"):  # POSIX
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pgid = None  # grupo ya no existe: se mata solo el proceso
+    if pgid is None:
         try:
             proc.terminate()
         except OSError:
@@ -119,11 +152,36 @@ def _terminate(proc) -> None:
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (AttributeError, OSError, ProcessLookupError):
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+        else:
             proc.kill()
-        proc.wait()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _request_stop(proc) -> bool:
+    """Pide que el proceso termine solo (Ctrl-C / CTRL_BREAK).
+
+    En Windows, `send_signal(SIGINT)` no existe para hijos: se usa
+    CTRL_BREAK_EVENT, que solo funciona si el proceso nació en su propio grupo
+    (ver `_new_process_kwargs`). Devuelve False si no se pudo pedir.
+    """
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        if os.name == "nt":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            proc.send_signal(signal.SIGINT)
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def on_cancel(key: str) -> str:
@@ -162,6 +220,19 @@ def _gpu_index(gpu_idx: str, mode: str) -> str:
     return idx if idx not in ("", "auto") else ""
 
 
+def _child_env(base: dict) -> dict:
+    """Fuerza UTF-8 en los subprocesos.
+
+    Sin esto, en Windows el log del CLI se decodifica con la codificación de
+    la consola (cp1252 en español) y al imprimir '✅' o '°C' el proceso muere
+    con UnicodeEncodeError aunque el informe ya esté escrito.
+    """
+    env = dict(base)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _ollama_env(mode, gpu_idx: str) -> dict:
     """Entorno para el subproceso CLI.
 
@@ -171,7 +242,7 @@ def _ollama_env(mode, gpu_idx: str) -> dict:
     CUDA_VISIBLE_DEVICES  -> índice visible también para Whisper (torch).
     AUDITV_STATUS_FILE    -> dónde escribir el estado que pinta el panel de GPU.
     """
-    env = dict(os.environ)
+    env = _child_env(os.environ)
     env["OLLAMA_NUM_GPU"] = {"auto": "auto", "gpu": "-1", "cpu": "0"}[_gpu_mode(mode)]
     idx = _gpu_index(gpu_idx, mode)
     if idx:
@@ -230,16 +301,62 @@ def _fmt_temp(temp, warn=None, abort=None) -> tuple:
     return f"{temp:.0f}°C", "#2f9e44"
 
 
+def _load_color(pct) -> str:
+    """Verde por debajo del 60 %, naranja hasta el 85 %, rojo por encima."""
+    if pct is None:
+        return "var(--body-text-color-subdued)"
+    if pct >= 85:
+        return "#e03131"
+    if pct >= 60:
+        return "#e8590c"
+    return "#2f9e44"
+
+
+def _bar(pct, color) -> str:
+    """Barrita de progreso para un porcentaje (o un guion si no se midió)."""
+    if pct is None:
+        return ""
+    pct = max(0.0, min(100.0, float(pct)))
+    return (f"<span style='display:inline-block;width:44px;height:6px;"
+            f"border-radius:3px;background:rgba(128,128,128,.22);"
+            f"vertical-align:middle;margin-right:4px'>"
+            f"<span style='display:block;width:{pct:.0f}%;height:6px;"
+            f"border-radius:3px;background:{color}'></span></span>")
+
+
+def _metric(label, value, color=None, extra="") -> str:
+    """Una cifra del panel: etiqueta, valor coloreado y detalle."""
+    col = color or "inherit"
+    return (f"<span><span style='opacity:.7'>{label}</span> "
+            f"<b style='color:{col}'>{value}</b>{extra}</span>")
+
+
+def _component_row(name, model, device, res, vram_mb=None) -> tuple:
+    """(etiqueta, valor) de un componente del panel con su consumo."""
+    marks = []
+    if res and res.get("rss_mb"):
+        marks.append(f"{hardware.fmt_mem(res['rss_mb'])} RAM")
+        if res.get("cpu_pct"):
+            marks.append(f"{hardware.fmt_pct(res['cpu_pct'])} CPU")
+        if res.get("threads"):
+            marks.append(f"{res['threads']} hilos")
+    if vram_mb:
+        marks.append(f"{hardware.fmt_vram(vram_mb)} VRAM")
+    where = f" · {device.upper()}" if device else ""
+    return (name, f"{model or '—'}{where}" + ("  ·  " + " · ".join(marks) if marks else ""))
+
+
 def gpu_panel_html() -> str:
-    """Panel de GPU/equipo: qué tarjeta hay, su temperatura y si se está usando.
+    """Panel de equipo: GPU, CPU y RAM, con el consumo de Whisper y de la IA local.
 
     Se refresca cada 2 s con un Timer. El estado de la ejecución (qué está
     usando la GPU ahora) viene del fichero que escribe el CLI; la temperatura
-    se lee aquí directo, para que también se vea con la app en reposo.
+    y el consumo se leen aquí directo, para que también se vea en reposo.
     """
     st = read_status()
     gpus = hardware.gpu_infos()
     gpu = hardware.primary_gpu(gpus)
+    mps = hardware.torch_mps_info() if not gpu else {}
     thresholds = st.get("thresholds") or {}
     warn = thresholds.get("warn")
     abort = thresholds.get("abort")
@@ -247,7 +364,26 @@ def gpu_panel_html() -> str:
     running = bool(st.get("running"))
     resting = bool(st.get("gpu_resting"))
 
-    if gpu:
+    # Consumo medido del equipo y de cada componente.
+    res = hardware.resource_snapshot(cli_pid=st.get("pid") if running else None)
+
+    if not gpu and mps.get("usable"):
+        # macOS con chip Apple Silicon: la GPU existe pero nvidia-smi no la ve.
+        gpu = {"index": 0, "name": mps.get("name") or "Apple GPU",
+               "vram_total_mb": mps.get("vram_mb") or 0, "vram_used_mb": 0,
+               "temp_c": None, "util_pct": None, "compute_cap": None,
+               "shared": True}
+        state, state_color = ("en uso", "#2f9e44") if running else (
+            "libre", "var(--body-text-color-subdued)")
+        detail = (f"{gpu['name']} (Metal, memoria compartida con la CPU"
+                  f" ≈ {hardware.fmt_vram(gpu['vram_total_mb'])})")
+        temp, temp_color = "—", "var(--body-text-color-subdued)"
+        vram_used = 0
+        vram_total = gpu["vram_total_mb"]
+        vram_pct = None
+        # nvidia-smi no mide la memoria de MPS: se muestra la del sistema.
+        vram_total = vram_used = 0
+    elif gpu:
         temp, temp_color = _fmt_temp(st.get("gpu_temp") or gpu.get("temp_c"),
                                      warn, abort)
         if resting:
@@ -266,10 +402,16 @@ def gpu_panel_html() -> str:
             detail += f" · {util} % de uso"
         free = hardware.gpu_free_mb(gpu)
         detail += f" · {hardware.fmt_vram(free)} libres"
+        vram_used = gpu.get("vram_used_mb") or 0
+        vram_total = gpu.get("vram_total_mb") or 0
+        vram_pct = (vram_used / vram_total * 100) if vram_total else None
     else:
         temp, temp_color = "—", "var(--body-text-color-subdued)"
         state, state_color = "no detectada", "var(--body-text-color-subdued)"
-        detail = "No hay GPU NVIDIA detectable: todo irá en CPU."
+        detail = ("No se detecta GPU (ni NVIDIA ni Apple MPS): todo irá en CPU."
+                  if mps else
+                  "No hay GPU NVIDIA detectable: todo irá en CPU.")
+        vram_used = vram_total = vram_pct = 0
 
     # Qué equipo de transcripción y de análisis se ha elegido en esta ejecución.
     wdev = st.get("whisper_device") or st.get("device")
@@ -281,18 +423,30 @@ def gpu_panel_html() -> str:
     pending = " (pendiente)"
     if not st:
         # Todavía no ha corrido nada: se enseña lo que se usaría con «auto».
-        info = hardware.torch_cuda_info()
-        wdev = "cuda" if info.get("usable") else "cpu"
+        info = hardware.torch_gpu_info()
+        kind = info.get("kind") or "cpu"
+        wdev = kind if kind in ("cuda", "mps") else "cpu"
         wmodel = hardware.recommend_whisper_model(wdev, info.get("vram_mb"))
         lmodel, _best = hardware.pick_ollama_model()
         ldev = "GPU" if hardware.ollama_gpu_default()[0] else "CPU"
         auto_mark = llm_mark = pending
 
+    # VRAM de la IA local: la reporta Ollama en /api/ps.
+    loaded = hardware.ollama_running_models()
+    ollama_vram = 0
+    for m in loaded:
+        if not lmodel or m["name"].split(":")[0] in lmodel:
+            ollama_vram += m["size_vram_mb"]
+
+    # La RAM de Ollama solo se muestra si tiene un modelo cargado: en reposo su
+    # proceso está en memoria pero no hace nada, y solo confunde.
+    ollama_res = res.get("ollama") if (running and loaded) else None
     rows = [
-        ("Whisper", f"{wmodel or '—'}{auto_mark}" + (f" · {wdev.upper()}"
-         if wdev else "")),
-        ("IA local", f"{lmodel or '—'}{llm_mark}" + (f" · {ldev}"
-         if ldev else "")),
+        _component_row("Whisper", f"{wmodel or '—'}{auto_mark}", wdev,
+                       res.get("whisper") if running else None,
+                       hardware.gpu_vram_of_pid(st.get("pid")) if running else 0),
+        _component_row("IA local", f"{lmodel or '—'}{llm_mark}", ldev,
+                       ollama_res, ollama_vram),
     ]
     stage = st.get("stage") or ""
     batch = st.get("batch") or st.get("whisper_batch") or ""
@@ -300,7 +454,7 @@ def gpu_panel_html() -> str:
         rows.insert(0, ("Ahora", " · ".join(x for x in (stage, batch) if x)))
 
     table = "".join(
-        f"<tr><td style='padding:1px 8px 1px 0;opacity:.7'>{k}</td>"
+        f"<tr><td style='padding:1px 10px 1px 0;opacity:.7;white-space:nowrap'>{k}</td>"
         f"<td style='padding:1px 0'>{v}</td></tr>"
         for k, v in rows
     )
@@ -311,14 +465,37 @@ def gpu_panel_html() -> str:
         limits += f"<br><span style='color:#e8590c'>{st['gpu_rest_reason']}"
         limits += " — los lotes siguen en CPU, sin perder nada.</span>"
 
+    # Barra de equipo: CPU, RAM y VRAM del sistema entero.
+    cores = res.get("cpu_cores")
+    cpu_pct = res.get("cpu_pct")
+    ram_pct = res.get("ram_pct")
+    sw = res.get("swap_used_mb")
+    sysline = " · ".join(x for x in (
+        _metric("CPU", f"{hardware.fmt_pct(cpu_pct)}", _load_color(cpu_pct),
+                _bar(cpu_pct, _load_color(cpu_pct))),
+        _metric("RAM", f"{hardware.fmt_mem(res.get('ram_used_mb'))} / "
+                 f"{hardware.fmt_mem(res.get('ram_total_mb'))}",
+                 _load_color(ram_pct), _bar(ram_pct, _load_color(ram_pct))),
+        _metric("VRAM", f"{hardware.fmt_vram(vram_used)} / "
+                 f"{hardware.fmt_vram(vram_total)}", _load_color(vram_pct),
+                _bar(vram_pct, _load_color(vram_pct))),
+        _metric("Núcleos", cores or "—"),
+        _metric("Libre", hardware.fmt_mem(res.get("ram_avail_mb"))),
+        _metric("Swap", hardware.fmt_mem(sw) if sw else "—"),
+    ) if x)
+
     return f"""<div style="border:1px solid rgba(128,128,128,.25);border-radius:8px;
-  padding:.5rem .75rem;margin-bottom:.5rem;font-size:.92em;line-height:1.35">
+  padding:.5rem .75rem;margin-bottom:.5rem;font-size:.92em;line-height:1.5">
   <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
     <span style="font-weight:600">🎮 GPU</span>
     <span>{detail}</span>
     <span style="color:{temp_color};font-weight:600">🌡 {temp}</span>
     <span style="color:{state_color}">● {state}</span>
     <span style="opacity:.6;font-size:.85em">{limits}</span>
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-top:.3rem;
+    padding-top:.3rem;border-top:1px solid rgba(128,128,128,.18)">
+    {sysline}
   </div>
   <table style="border-collapse:collapse;margin-top:.25rem">{table}</table>
 </div>"""
@@ -328,6 +505,20 @@ def refresh_gpu_panel() -> str:
     return gpu_panel_html()
 
 
+def _new_process_kwargs() -> dict:
+    """Opciones para crear el CLI en su propio grupo de procesos.
+
+    En POSIX, `start_new_session` lo independiza de la terminal (así se puede
+    matar el grupo entero, con ffmpeg/yt-dlp dentro). En Windows no existe esa
+    opción: lo equivalente es `CREATE_NEW_PROCESS_GROUP`, y hace falta además
+    `CREATE_NO_WINDOW` para que no salte una ventana de consola detrás.
+    """
+    if os.name == "nt":
+        return {"creationflags": (subprocess.CREATE_NEW_PROCESS_GROUP
+                                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))}
+    return {"start_new_session": True}
+
+
 def _run_cli_streaming(args, key="video", env=None):
     """Run the CLI and stream its log lines (stderr) to the UI."""
     proc = subprocess.Popen(
@@ -335,9 +526,11 @@ def _run_cli_streaming(args, key="video", env=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
-        start_new_session=True,
-        env=env or os.environ,
+        env=env or _child_env(os.environ),
+        **_new_process_kwargs(),
     )
     _RUNNER[key] = proc
     lines = []
@@ -442,21 +635,46 @@ def _gpu_controls():
     )
 
 
+def _pick_directory_tk() -> str:
+    """Selector de carpetas de Tk (viene con Python en Windows y macOS)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return ""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(
+            title="Selecciona la carpeta de salida", initialdir=_DEFAULT_OUTDIR
+        )
+        root.destroy()
+        return chosen or ""
+    except Exception:
+        return ""
+
+
 def pick_directory() -> str:
-    """Open a native folder picker (kdialog/zenity) and return the path."""
+    """Abre el selector de carpetas del sistema y devuelve la ruta.
+
+    Primero se intenta el selector nativo de escritorio (kdialog/zenity, que es
+    lo de Linux); en Windows y macOS, donde no existen, se cae al de Tk.
+    """
     for picker in (
         ["kdialog", "--getexistingdirectory", _DEFAULT_OUTDIR],
         ["zenity", "--file-selection", "--directory", "--title=Selecciona carpeta"],
     ):
         try:
             out = subprocess.run(
-                picker, capture_output=True, text=True, timeout=60
+                picker, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60,
             )
         except Exception:
             continue
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()
-    return ""
+    return _pick_directory_tk()
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +770,9 @@ def on_live_start(source, model, device, out_txt):
          "--model", model or "auto", "--device", device or "auto",
          "-o", out_txt],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        encoding="utf-8", errors="replace",
+        env=_child_env(os.environ),
+        **_new_process_kwargs(),
     )
     return f"Captura iniciada desde '{source or 'auto'}'. Escribe la transcripción en {out_txt}"
 
@@ -559,7 +780,8 @@ def on_live_start(source, model, device, out_txt):
 def on_live_stop():
     proc = _LIVE.get("proc")
     if proc and proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
+        if not _request_stop(proc):
+            proc.terminate()  # sin Ctrl-C posible: se corta en seco
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
@@ -598,11 +820,8 @@ def build_app() -> gr.Blocks:
         with gr.Tab("Video / URL"):
             with gr.Row():
                 file_in = gr.File(
-                    file_types=[
-                        ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts",
-                        ".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac", ".aac",
-                        ".wma", ".aif", ".aiff", ".m4b",
-                    ],
+                    # Sin lista de extensiones: se acepta cualquier formato
+                    # (video, audio o contenedor raro) y ffmpeg decide.
                     label="Video o audio local (opcional)",
                 )
                 with gr.Column():
@@ -614,7 +833,8 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta de salida (informe + frames)")
                 outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
-                device = gr.Dropdown(["auto", "cpu", "cuda"], value="auto", label="Device")
+                device = gr.Dropdown(["auto", "cpu", "cuda", "mps"], value="auto",
+                                label="Device")
                 model = _whisper_dropdown()
             with gr.Row():
                 interval = gr.Slider(1, 60, value=10, step=1, label="Intervalo frames (s)")
@@ -702,7 +922,8 @@ def build_app() -> gr.Blocks:
                     label="Fuente de audio (auto = sistema/.monitor · alsa_input… = micrófono)",
                 )
                 live_model = _whisper_dropdown(live=True)
-                live_device = gr.Dropdown(["auto", "cpu", "cuda"], value="auto", label="Device")
+                live_device = gr.Dropdown(["auto", "cpu", "cuda", "mps"], value="auto",
+                                label="Device")
             with gr.Row():
                 live_out = gr.Textbox(
                     value=str(_PROJECT / "informes" / "reunion_live.txt"),

@@ -18,6 +18,7 @@ venv\Scripts\pip install "gradio>=6"
 
 echo.
 where ffmpeg >nul 2>nul && (echo -^> ffmpeg: OK) || echo -^> ffmpeg: NO instalado ^(winget install ffmpeg o descárgalo y añádelo al PATH^)
+if exist venv\Scripts\yt-dlp.exe (echo -^> yt-dlp: OK ^) o (echo -^> yt-dlp: NO instalado)
 where ollama >nul 2>nul && (echo -^> ollama: OK) || echo -^> ollama: NO instalado ^(solo para el análisis con IA^)
 echo.
 echo Listo. Para arrancar la GUI: doble clic en iniciar_gui.bat

@@ -28,6 +28,10 @@ brew install ffmpeg
 
 Instalación de Ollama: https://ollama.com/download (Linux, macOS, Windows).
 
+En Windows, ffmpeg se instala con `winget install ffmpeg` o desde
+<https://ffmpeg.org/download.html> (añadirlo al PATH). AuditV no necesita nada
+más: `yt-dlp` y el resto llegan con el venv.
+
 ## 2. Obtener el proyecto
 
 ```bash
@@ -41,15 +45,21 @@ hay que crearlo en la máquina nueva.
 ## 3. Instalar dependencias Python
 
 ```bash
+# Linux / macOS
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
+
+En Windows, doble clic en `instalar.bat`, que hace lo mismo con
+`venv\Scripts\python.exe`. Después se arranca con `iniciar_gui.bat`.
 
 Esto instala:
 
 - `openai-whisper` — transcripción local
 - `torch` — backend de Whisper
 - `yt-dlp` — descarga de videos desde URLs (YouTube, etc.)
+- `gradio` — interfaz
+- `psutil` — cifras de CPU/RAM del panel (opcional, pero recomendado)
 
 El modelo de Whisper se descarga automáticamente en el primer uso
 (`~75 MB` para `small`, `~1.5 GB` para `large`).

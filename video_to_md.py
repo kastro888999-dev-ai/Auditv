@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import warnings
 import wave
-from pathlib import Path
+from pathlib import Path, PurePath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hardware  # noqa: E402  (detección agnóstica de GPU/modelos)
@@ -40,7 +40,18 @@ DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "auto")
 DEFAULT_FRAME_INTERVAL = 10.0  # seconds between captured frames
 # Extensiones de archivos solo-audio (se transcriben igual pero sin frames).
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac", ".aac",
-              ".wma", ".aif", ".aiff", ".m4b", ".m4p", ".ape", ".amr"}
+              ".wma", ".aif", ".aiff", ".m4b", ".m4p", ".ape", ".amr",
+              ".w64", ".au", ".ra", ".ac3", ".dts", ".alac"}
+# Contenedores de video habituales. La lista NO es restrictiva: si el archivo
+# descargado trae otra extensión, se acepta igual (ffmpeg/Whisper la leen).
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".flv",
+              ".wmv", ".mpg", ".mpeg", ".m2ts", ".mts", ".m2v", ".3gp", ".3g2",
+              ".ogv", ".mp4v", ".vob", ".rm", ".rmvb", ".asf", ".divx", ".f4v",
+              ".mxf", ".dv", ".gif", ".f4a", ".wtv", ".nsv", ".roq"}
+# Acompañantes que yt-dlp deja junto al medio: nunca son el video descargado.
+SIDECAR_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".vtt", ".srt", ".ass",
+                ".ssa", ".lrc", ".sbv", ".json", ".xml", ".description", ".part",
+                ".ytdl", ".temp", ".tmp", ".download"}
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # Tamaño de parte para el análisis por trozos de transcripciones largas
 # (unifica el flujo de video y de apuntes; ~6000 chars = JSON completo en ctx 4096).
@@ -132,18 +143,38 @@ def _write_status() -> None:
     un JSON a medias)."""
     if not STATUS_FILE:
         return
+    tmp = f"{STATUS_FILE}.{os.getpid()}.tmp"
     try:
         payload = dict(_status["data"])
         payload["thresholds"] = {
             "warn": GPU_TEMP_WARN, "abort": GPU_TEMP_ABORT,
             "resume": GPU_TEMP_RESUME,
         }
-        tmp = f"{STATUS_FILE}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
-        os.replace(tmp, STATUS_FILE)
     except Exception as exc:  # nunca romper el análisis por el panel
         log(f"No se pudo escribir el estado ({exc})", "WARN")
+        return
+    # En Windows, `os.replace` falla con PermissionError si la GUI tiene el
+    # JSON abierto en ese instante (no comparte delete). Se reintenta un poco
+    # porque, si no, el panel se queda congelado con datos viejos.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, STATUS_FILE)
+            return
+        except PermissionError:
+            if attempt == 4:
+                log("No se pudo actualizar el estado (archivo abierto en la "
+                    "GUI); se reintentará en la próxima actualización.", "WARN")
+                return
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            log(f"No se pudo escribir el estado ({exc})", "WARN")
+            return
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -165,20 +196,42 @@ def gpu_index_list() -> list:
 
 
 def detect_device(hint: str = DEVICE_HINT) -> str:
-    """Return 'cuda' if torch can actually run on the GPU, else 'cpu'.
+    """Device para Whisper: 'cuda', 'mps' (Mac) o 'cpu'.
 
-    Hint: 'cpu' forces CPU (safe on laptops with weak cooling), 'cuda' forces
-    CUDA, 'auto' uses the GPU only if this PyTorch build really supports it
-    (una GTX 1060 sm_61, por ejemplo, cae siempre a CPU).
+    Hint: 'cpu' forces CPU (safe on laptops with weak cooling), 'cuda'/'mps'
+    force that backend, 'auto' uses the GPU only if this PyTorch build really
+    supports it (una GTX 1060 sm_61, por ejemplo, cae siempre a CPU).
     """
     if hint == "cpu":
         log("Device forzado a CPU (AUDITV_DEVICE=cpu / --device cpu).", "DEVICE")
         status_update(device="cpu", device_reason="forzado por el usuario")
         return "cpu"
 
+    if hint == "mps":
+        mps = hardware.torch_mps_info()
+        if mps.get("usable"):
+            log(f"Device forzado a MPS: {mps.get('name')}.", "DEVICE")
+            status_update(device="mps", device_reason=mps.get("name"))
+            return "mps"
+        log(f"MPS pedido pero no usable ({mps.get('reason')}): CPU.", "DEVICE")
+        status_update(device="cpu", device_reason=mps.get("reason"))
+        return "cpu"
+
     info = hardware.torch_cuda_info()
     if not info.get("available"):
-        log(f"Sin GPU para PyTorch ({info.get('reason') or 'sin CUDA'}): CPU.", "DEVICE")
+        # Sin CUDA: en macOS puede estar la GPU de Apple (MPS).
+        mps = hardware.torch_mps_info()
+        if mps.get("usable"):
+            log(
+                f"GPU para Whisper: {mps.get('name')} (Metal, "
+                f"{hardware.fmt_vram(mps.get('vram_mb'))} de memoria "
+                f"compartida).",
+                "DEVICE",
+            )
+            status_update(device="mps", device_reason=mps.get("name"))
+            return "mps"
+        log(f"Sin GPU para PyTorch ({info.get('reason') or 'sin CUDA'}): CPU.",
+            "DEVICE")
         status_update(device="cpu", device_reason=info.get("reason") or "sin CUDA")
         return "cpu"
     if not info.get("usable"):
@@ -221,12 +274,15 @@ def resolve_whisper_model(requested: str = None, device: str = "cpu",
     vram = None
     if str(device).startswith("cuda"):
         vram = hardware.torch_cuda_info().get("vram_mb") or None
+    elif str(device).startswith("mps"):
+        vram = hardware.torch_mps_info().get("vram_mb") or None
     model = hardware.recommend_whisper_model(device, vram, duration_s)
     cached = hardware.whisper_cached_models()
     extra = f" Ya en caché: {', '.join(cached)}." if cached else ""
+    on_gpu = not str(device).startswith("cpu")
     log(
         f"Modelo Whisper 'auto' -> {model} "
-        f"({'GPU' if str(device).startswith('cuda') else 'CPU'}, "
+        f"({'GPU' if on_gpu else 'CPU'}, "
         f"{int((duration_s or 0) // 60)} min de audio).{extra}",
         "DEVICE",
     )
@@ -523,9 +579,10 @@ def media_duration(path: str) -> float:
     """Duración en segundos del medio (0 si ffprobe no responde)."""
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [*_tool_cmd("ffprobe"), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
         )
         if out.returncode == 0 and out.stdout.strip():
             return float(out.stdout.strip().splitlines()[0])
@@ -537,10 +594,35 @@ def media_duration(path: str) -> float:
 # ---------------------------------------------------------------------------
 # Audio extraction
 # ---------------------------------------------------------------------------
+def _tool_cmd(name: str) -> list:
+    """Cómo invocar una herramienta externa (ffmpeg, ffprobe, yt-dlp).
+
+    Se usa `shutil.which` para el PATH, y si no aparece se recurre al
+    intérprete del venv: en Windows los ejecutables de pip caen en
+    `venv\\Scripts` (o `venv\\bin`), que no suele estar en el PATH cuando la
+    GUI se abre con doble clic. Devolver una lista vacía hace que el comando
+    falle con un mensaje claro en vez de con un FileNotFoundError.
+    """
+    found = shutil.which(name)
+    if found:
+        return [found]
+    candidates = [
+        Path(sys.executable).parent / (name + (".exe" if os.name == "nt" else "")),
+        PROJECT_DIR / "venv" / ("Scripts" if os.name == "nt" else "bin")
+        / (name + (".exe" if os.name == "nt" else "")),
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return [str(cand)]
+    log(f"No se encuentra '{name}'. Instálalo y ponlo en el PATH "
+        f"(yt-dlp: pip install -r requirements.txt).", "ERROR")
+    return []
+
+
 def extract_audio(video_path: str, output_wav: str) -> str:
     """Extract mono 16kHz WAV audio from video via ffmpeg."""
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        *_tool_cmd("ffmpeg"), "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le",
         "-ar", "16000", "-ac", "1",
         output_wav,
@@ -557,9 +639,10 @@ def has_video_stream(path: str) -> bool:
     """
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v",
+            [*_tool_cmd("ffprobe"), "-v", "error", "-select_streams", "v",
              "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
         )
         if out.returncode == 0 and out.stdout.strip():
             return True
@@ -646,9 +729,11 @@ def transcribe_audio(audio_path: str, model_size: str, device: str,
         try:
             import whisper
         except Exception as exc:
+            pip = (r"venv\Scripts\pip.exe" if os.name == "nt"
+                   else "./venv/bin/pip")
             raise RuntimeError(
-                "openai-whisper is not installed. Run: "
-                "./venv/bin/pip install openai-whisper"
+                f"openai-whisper is not installed. Run: "
+                f"{pip} install openai-whisper"
             ) from exc
 
     log(f"Loading Whisper model '{model_size}' on {device}...")
@@ -755,12 +840,12 @@ def _transcribe_chunked(model, audio_path: str, device: str, duration: float,
             status_update(
                 stage="transcripción",
                 whisper_batch=f"{i}/{n_batches}",
-                whisper_batch_device="GPU" if current == "cuda" else "CPU",
+                whisper_batch_device="GPU" if current != "cpu" else "CPU",
                 whisper_segments=len(segments),
             )
             log(
                 f"Lote {i}/{n_batches} desde {fmt_ts(offset)} en "
-                f"{'GPU' if current == 'cuda' else 'CPU'}: {len(new_segs)} "
+                f"{'GPU' if current != 'cpu' else 'CPU'}: {len(new_segs)} "
                 f"segmentos ({len(segments)} en total).",
                 "AUDITV",
             )
@@ -811,7 +896,7 @@ def extract_video_frames(video_path: str, output_dir: str,
     """Extract frames every interval_sec. Returns list of {path, timestamp}."""
     os.makedirs(output_dir, exist_ok=True)
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        *_tool_cmd("ffmpeg"), "-y", "-i", video_path,
         "-vf", f"fps=1/{interval_sec}",
         "-qscale:v", "2",
         os.path.join(output_dir, "frame_%06d.png"),
@@ -1361,9 +1446,16 @@ def build_frames_section(frames: list, frames_dir: str, output_md: str = None) -
         stamp = fmt_ts(f["timestamp"])
         ref = f["path"]
         if md_dir:
-            rel = os.path.relpath(str(Path(f["path"]).resolve()), md_dir)
-            if not rel.startswith(".."):
-                ref = rel
+            try:
+                rel = os.path.relpath(str(Path(f["path"]).resolve()), md_dir)
+            except ValueError:
+                # En Windows, relpath lanza si el .md y los frames están en
+                # unidades distintas; se deja la ruta absoluta.
+                rel = None
+            # Siempre con "/" hacia delante: en Markdown la "\" es carácter de
+            # escape, así que `..\frames\a.png` no renderiza en ningún visor.
+            if rel is not None and not rel.startswith(".."):
+                ref = PurePath(rel).as_posix()
         lines.append(f"### 🖼️ T={stamp}")
         lines.append(f"![Frame T={stamp}]({ref})")
         lines.append("")
@@ -1928,6 +2020,44 @@ def is_url(path_or_url: str) -> bool:
     return path_or_url.startswith(("http://", "https://", "www."))
 
 
+def _pick_downloaded_file(output_dir: str) -> str:
+    """Devuelve la ruta del medio recién descargado en `output_dir`.
+
+    Se acepta cualquier formato: primero se priorizan video/audio conocidos y a
+    continuación, si el título de la plataforma trae una extensión rara (p.ej.
+    "reunion.mp4.mp4"), cualquier otro archivo que no sea un acompañante
+    (miniatura, subtítulos, descarga incompleta .part).
+    """
+    out = Path(output_dir)
+    if not out.is_dir():
+        raise RuntimeError(f"Could not find download folder {output_dir}")
+
+    def _mtime(p: Path) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    files = sorted(
+        (f for f in out.glob("*") if f.is_file() and not f.name.startswith(".")),
+        key=_mtime,
+        reverse=True,
+    )
+    preferred = VIDEO_EXTS | AUDIO_EXTS
+    for exts in (preferred, None):
+        for f in files:
+            suffix = f.suffix.lower()
+            if exts is None:
+                if suffix in SIDECAR_EXTS:
+                    continue
+            elif suffix not in exts:
+                continue
+            if f.stat().st_size > 0:
+                log(f"Downloaded -> {f}")
+                return str(f)
+    raise RuntimeError(f"Could not find downloaded video in {output_dir}")
+
+
 def download_video(
     url: str,
     output_dir: str,
@@ -1947,9 +2077,11 @@ def download_video(
     log(f"Downloading video from URL: {url}")
     out_template = os.path.join(output_dir, "%(title)s.%(ext)s")
     cmd = [
-        "yt-dlp",
+        *_tool_cmd("yt-dlp"),
         "--no-playlist",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # mp4 si existe; si no, cualquier contenedor soportado + audio.
+        "-f", ("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/"
+               "bestvideo+bestaudio/best"),
         "-o", out_template,
         "--merge-output-format", "mp4",
         "--no-warnings",
@@ -1963,14 +2095,8 @@ def download_video(
     cmd.append(url)
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Find the downloaded file (yt-dlp may rename it)
-    files = sorted(Path(output_dir).glob("*.*"), key=os.path.getmtime, reverse=True)
-    ok_suffixes = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts") | AUDIO_EXTS
-    for f in files:
-        if f.suffix.lower() in ok_suffixes:
-            log(f"Downloaded -> {f}")
-            return str(f)
-    raise RuntimeError(f"Could not find downloaded video in {output_dir}")
+    # Find the downloaded file (yt-dlp may rename it).
+    return _pick_downloaded_file(output_dir)
 
 
 def _ask_keep_or_delete(artifacts: list) -> bool:
@@ -2326,11 +2452,11 @@ def main(argv=None) -> int:
                               "largo (> %d chars) se divide igualmente para generar "
                               "los .md por parte y el informe completo fusionado"
                               % ANALYSIS_PART_CHARS)
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"),
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"),
                         default=DEVICE_HINT,
                         help="Dispositivo para Whisper: auto (default), cpu "
-                             "(más seguro en portátiles con refrigeración justa) "
-                             "o cuda")
+                             "(más seguro en portátiles con refrigeración justa), "
+                             "cuda (NVIDIA) o mps (GPU de Apple en macOS)")
     parser.add_argument("--autoclean", choices=("ask", "keep", "delete"), default="ask",
                         help="Qué hacer al terminar con los archivos descargados y "
                              "generados: 'ask' (preguntar), 'keep' o 'delete' "

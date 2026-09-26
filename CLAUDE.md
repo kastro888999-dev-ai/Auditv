@@ -103,8 +103,11 @@ haga todo desde el navegador sin terminal: pestañas de video/URL, apuntes
 desde `.txt` y reunión en vivo. Se lanza con
 `./venv/bin/python tools/auditv_gui.py` (requiere `pip install "gradio>=6"`,
 Gradio 4 no compila Pillow en Python 3.14). Encima de las pestañas hay un
-**panel de GPU** que muestra tarjeta, VRAM, temperatura y si se está usando
-(«en uso» / «en descanso» / «libre» / «no detectada»), refrescado cada 2 s.
+**panel de equipo** refrescado cada 2 s: tarjeta, VRAM, temperatura y estado
+(«en uso» / «en descanso» / «libre» / «no detectada»), más una barra de CPU/RAM/
+VRAM del sistema y el consumo (RAM, % de CPU, hilos, VRAM) de Whisper y de la
+IA local por separado. Ese consumo sale de `psutil` y de `/api/ps` de Ollama;
+`psutil` es opcional y sin él el panel solo pierde esas cifras.
 
 ## Qué hace
 
@@ -195,7 +198,9 @@ ejecución**. La herramienta incluye protecciones para que no ocurra:
   está fresca; con una GPU débil el LLM va directo a CPU sin calentarla.
 - El estado (qué device usa cada cosa, temperatura, si la GPU está en descanso
   y por qué) se escribe en un JSON (`AUDITV_STATUS_FILE`) que la GUI lee cada
-  2 s para pintar su panel de GPU.
+  2 s para pintar su panel de equipo. El consumo de CPU/RAM se mide aparte con
+  `hardware.resource_snapshot()`, que cachea 1,5 s porque la GUI la interroga
+  cada 2 s.
 
 Si el PC se apagó o se nota caliente, el agente debería reejecutar así:
 
