@@ -657,22 +657,28 @@ def _whisper_dropdown(live: bool = False):
     )
 
 
-def _gpu_controls():
-    """Selector de dónde corre el LLM, preajustado a la potencia del equipo.
-
-    Devuelve (radio, desplegable de índice de GPU, botón de redetectar).
-    """
+def _gpu_where_radio():
+    """Radio de dónde corre el LLM, preajustado a la potencia del equipo."""
     use_gpu, reason = hardware.ollama_gpu_default()
+    return gr.Radio(
+        ["auto", "gpu", "cpu"],
+        value="auto",
+        label="Dónde corre la IA (Ollama)",
+        info=(f"«auto» = recomendado aquí: "
+              f"{'GPU' if use_gpu else 'CPU'}. {reason}"),
+    )
+
+
+def _gpu_index_control():
+    """Desplegable de índice de GPU y su botón de redetectar.
+
+    Van juntos porque el botón solo tiene sentido con el desplegable al lado.
+    `scale=0` para que el botón no reparta el ancho de la fila y `size="sm"`
+    para que no destaque más que el campo.
+    """
     return (
-        gr.Radio(
-            ["auto", "gpu", "cpu"],
-            value="auto",
-            label="Dónde corre la IA (Ollama)",
-            info=(f"«auto» = recomendado aquí: "
-                  f"{'GPU' if use_gpu else 'CPU'}. {reason}"),
-        ),
         gr.Dropdown(list_gpu_indices(), value="auto", label="GPU para la IA (índice)"),
-        gr.Button("↻ Detectar GPUs"),
+        gr.Button("↻ GPUs", scale=0, size="sm", min_width=78),
     )
 
 
@@ -944,15 +950,27 @@ def build_app() -> gr.Blocks:
                 device = gr.Dropdown(["auto", "cpu", "cuda", "mps"], value="auto",
                                 label="Device")
                 model = _whisper_dropdown()
+            # ── IA local (Ollama) ───────────────────────────────────────
+            # Mismo patrón que el panel de origen: `variant="panel"` da el
+            # marco y `elem_id` el nombre. Cada funcionalidad va en su propia
+            # fila y, si tiene botón, el botón va en la MISMA fila que su
+            # campo (`scale=0` + `size="sm"`: el botón toma el ancho de su
+            # texto y no se luce más que el desplegable).
+            with gr.Column(variant="panel", elem_id="av_ia"):
+                with gr.Row():
+                    llm_m = ollama_dropdown()
+                    llm_refresh = gr.Button("↻ Modelos", scale=0, size="sm",
+                                           min_width=96)
+                with gr.Row():
+                    llm_use_gpu = _gpu_where_radio()
+                with gr.Row():
+                    llm_gpu_sel, llm_gpu_refresh = _gpu_index_control()
+                with gr.Row():
+                    no_llm = gr.Checkbox(label="Omitir análisis LLM")
             with gr.Row():
                 interval = gr.Slider(1, 60, value=10, step=1, label="Intervalo frames (s)")
                 autoclean = gr.Dropdown(["keep", "ask", "delete"], value="keep", label="Autoclean")
-                llm_m = ollama_dropdown()
-                llm_refresh = gr.Button("↻ Actualizar modelos")
-                no_llm = gr.Checkbox(label="Omitir análisis LLM")
                 extract_frames_cb = gr.Checkbox(value=True, label="Extraer frames")
-            with gr.Row():
-                llm_use_gpu, llm_gpu_sel, llm_gpu_refresh = _gpu_controls()
             with gr.Row():
                 cookies_browser = gr.Textbox(label="Cookies del navegador (chrome/firefox…)")
                 cookies_file = gr.Textbox(label="Archivo de cookies (ruta)")
@@ -997,13 +1015,16 @@ def build_app() -> gr.Blocks:
                         t_outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta del informe")
                         t_outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
                         t_llm = ollama_dropdown()
-                        t_llm_refresh = gr.Button("↻ Actualizar modelos")
+                        t_llm_refresh = gr.Button("↻ Modelos", scale=0, size="sm",
+                                                  min_width=96)
             with gr.Row():
                 t_split = gr.Checkbox(value=True, label="Dividir texto en partes: .md por cada parte + informe fusionado (los textos largos se dividen solos; aquí fijas el tamaño)")
                 t_split_chars = gr.Number(value=6000, minimum=2000, maximum=20000,
                                           step=500, label="Caracteres por parte")
             with gr.Row():
-                t_llm_use_gpu, t_llm_gpu_sel, t_llm_gpu_refresh = _gpu_controls()
+                t_llm_use_gpu = _gpu_where_radio()
+            with gr.Row():
+                t_llm_gpu_sel, t_llm_gpu_refresh = _gpu_index_control()
             with gr.Row():
                 t_btn = gr.Button("📝 Generar informe (_apuntes.md)", variant="primary")
             t_cancel = gr.Button("⏹ Cancelar", variant="stop")
@@ -1145,6 +1166,32 @@ _LAYOUT_CSS = """<style>
    líneas. */
 #av_origen > * {
   min-width: 0 !important;
+}
+/* Panel de la IA: mismo relleno que el de origen. */
+#av_ia {
+  padding: .75rem 1rem .9rem !important;
+  margin-bottom: .55rem !important;
+  gap: .5rem !important;
+}
+#av_ia > * {
+  min-width: 0 !important;
+}
+/* El check se queda pegado a la izquierda del panel. Gradio le pone la clase
+   `auto-margin` (margin-left/right: auto) al contenedor del checkbox, y eso lo
+   centra en la fila; con `margin-left: 0` y `margin-right: auto` se alinea a
+   la izquierda. `flex: 0 0 auto` para que no se estire. */
+#av_ia .checkbox-container {
+  margin-left: 0 !important;
+  margin-right: auto !important;
+  flex: 0 0 auto !important;
+  justify-content: flex-start !important;
+}
+/* Los botones de cada campo van en la MISMA fila que su campo (no en una fila
+   aparte), pero la fila usa `align-items: flex-start` y los dejaría pegados
+   arriba, junto a la etiqueta y no al campo. `align-self: center` los pone a la
+   altura del campo. */
+#av_ia .row > button {
+  align-self: center !important;
 }
 </style>"""
 

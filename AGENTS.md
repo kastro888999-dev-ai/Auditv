@@ -169,8 +169,22 @@ ancho de la pestaña:
   (`padding`, `margin-bottom`, `gap`) y pone `min-width: 0` a los hijos para que
   los campos puedan encogerse en pantallas estrechas.
 - Al añadir secciones, replica el patrón: `panel` + `elem_id` + un bloque de CSS
-  propio. Los `elem_id` ya usados: `av_origen`, `av_log_video`, `av_log_notes`,
-  `av_log_live`.
+  propio. Los `elem_id` ya usados: `av_origen`, `av_ia`, `av_log_video`,
+  `av_log_notes`, `av_log_live`.
+
+**Botones: en la fila de su campo, y pequeños.** Un botón que pertenece a un
+campo (actualizar modelos, redetectar GPUs) va en la **misma `gr.Row`** que su
+campo, no en una fila aparte. Se crea con `scale=0` (para que no reparta el
+ancho de la fila), `size="sm"` (Gradio 6 sale por defecto en `lg`, que se ve
+desproporcionado al lado de un desplegable) y un `min_width` pequeño. La fila
+usa `align-items: flex-start`, así que sin más el botón quedaría pegado arriba,
+junto a la etiqueta; `_LAYOUT_CSS` lo baja con `align-self: center` sobre
+`#av_ia .row > button`. Cada campo con botón tiene además su propia `gr.Row`.
+
+**Checkbox alineado a la izquierda.** Gradio mete la clase `auto-margin`
+(`margin-left/right: auto`) en el contenedor de los checkbox y lo centra. Para
+que un check quede a la izquierda del panel:
+`#av_ia .checkbox-container { margin-left: 0 !important; margin-right: auto !important; flex: 0 0 auto !important; justify-content: flex-start !important; }`.
 
 **Una sola fuente por campo, y el formato lo decide el código.** En la pestaña
 "Video / URL" hay un único campo para video **y** audio local
