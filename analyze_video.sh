@@ -11,8 +11,12 @@
 #   --no-llm              Skip Ollama analysis
 #   --output-dir DIR      Base dir for the .md and frames
 #   --frames-dir DIR      Explicit frames dir
-#   --device cpu          Force Whisper to CPU (recommended on weak-cooling
-#                         laptops that shut down on heavy GPU load)
+#   --device auto|cpu|cuda
+#                         Whisper: auto (default) usa la GPU solo si el equipo
+#                         la aguanta; cpu la evita; cuda la fuerza
+#   --ollama-gpu auto|gpu|cpu
+#                         Dónde corre el LLM: auto (default; GPU si la tarjeta
+#                         es potente y no está caliente), gpu o cpu
 #   --autoclean ask|keep|delete
 #                         What to do at the end with the downloaded video and
 #                         the generated .md/frames: ask, keep or delete
@@ -25,7 +29,7 @@
 # Example:
 #   ./analyze_video.sh /home/user/video.mp4
 #   ./analyze_video.sh /home/user/video.mp4 /home/user/out.md small 5
-#   ./analyze_video.sh "https://youtube.com/watch?v=..." out.md tiny 15 --no-llm
+#   ./analyze_video.sh "https://youtube.com/watch?v=..." out.md auto 15 --no-llm
 #   ./analyze_video.sh "https://youtube.com/watch?v=..." "" tiny 15 --autoclean keep
 
 set -euo pipefail
@@ -47,7 +51,9 @@ else
     VIDEO="${1:?Usage: analyze_video.sh <video_file_or_url> [output.md] [model] [interval] [flags...]}"
 fi
 OUTPUT="${2:-}"
-MODEL="${3:-small}"
+# "auto" = que el CLI elija el modelo de Whisper según el equipo (GPU, RAM) y
+# la duración del audio. Se puede fijar: tiny, base, small, medium, large...
+MODEL="${3:-auto}"
 INTERVAL="${4:-10}"
 EXTRA_ARGS=()
 

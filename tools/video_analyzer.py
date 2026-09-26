@@ -20,12 +20,37 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import video_to_md as _v2md  # noqa: E402
 from video_to_md import (  # noqa: E402
     video_to_md,
     transcript_to_md,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_WHISPER_MODEL,
 )
+
+# Dónde corre el LLM de Ollama: "auto" (según la potencia de la GPU y la
+# temperatura), "gpu" (forzada, con la protección térmica) o "cpu".
+OLLAMA_GPU_MODES = ("auto", "gpu", "cpu")
+
+
+def set_ollama_gpu(mode: str = "auto", gpu_index: str = None) -> None:
+    """Fija dónde debe correr el LLM para las siguientes llamadas.
+
+    Traduce el selector ('auto' | 'gpu' | 'cpu') al formato que espera
+    video_to_md (OLLAMA_NUM_GPU: auto / -1 / 0) y el índice de la GPU.
+    """
+    mode = (mode or "auto").strip().lower()
+    if mode not in OLLAMA_GPU_MODES:
+        raise ValueError(
+            f"ollama_gpu debe ser uno de {OLLAMA_GPU_MODES}, no {mode!r}"
+        )
+    _v2md.OLLAMA_NUM_GPU = {"auto": "auto", "gpu": "-1", "cpu": "0"}[mode]
+    if gpu_index is not None:
+        _v2md.OLLAMA_GPU_INDEX = gpu_index
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_index
+    else:
+        _v2md.OLLAMA_GPU_INDEX = None
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
 
 def analyze_video(
@@ -42,6 +67,8 @@ def analyze_video(
     cookies: str = None,
     cookies_from_browser: str = None,
     live_from_start: bool = False,
+    ollama_gpu: str = "auto",
+    ollama_gpu_index: str = None,
 ) -> str:
     """Analyze a video and return the path to the generated Markdown report.
 
@@ -49,9 +76,11 @@ def analyze_video(
         video_path: Path to the video file or URL (YouTube, etc.).
         output_md: Optional output .md path. Defaults next to the video
             (or in output_dir / `informes/` for URLs).
-        whisper_model: Whisper model size (base/small/medium/large).
+        whisper_model: Whisper model size, or "auto" (default) to pick the
+            best one for this machine and the audio length.
         frame_interval: Seconds between captured frames.
-        ollama_model: Ollama model id used for idea extraction.
+        ollama_model: Ollama model id, or "auto" (default) for the best
+            installed model that fits this machine.
         use_llm: If False, skip Ollama analysis (transcription + frames only).
         output_dir: Base dir for the .md and the frames dir. Takes priority
             over output_md's location for default frame placement.
@@ -63,10 +92,15 @@ def analyze_video(
         cookies_from_browser: reuse browser cookies (chrome/firefox/...) for
             platforms where the user is already logged in.
         live_from_start: download supported live streams from the start.
+        ollama_gpu: "auto" (default, GPU if the card is powerful enough and
+            cool), "gpu" or "cpu". Thermal protection always applies.
+        ollama_gpu_index: index of the GPU for Ollama ("auto" = the one Ollama
+            picks).
 
     Returns:
         Path (str) to the generated Markdown report.
     """
+    set_ollama_gpu(ollama_gpu, ollama_gpu_index)
     return video_to_md(
         video_path=video_path,
         output_md=output_md,
@@ -90,6 +124,9 @@ def analyze_transcript(
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
     use_llm: bool = True,
     output_dir: str = None,
+    ollama_gpu: str = "auto",
+    ollama_gpu_index: str = None,
+    split_chars: int = 0,
 ) -> str:
     """Generate standalone notes (ideas/discusiones/conclusiones) from a
     plain-text meeting transcript. Returns the path to the .md report.
@@ -97,12 +134,14 @@ def analyze_transcript(
     The report is written as a separate file next to the transcript (or in
     output_dir / --output). No video/audio/frames involved.
     """
+    set_ollama_gpu(ollama_gpu, ollama_gpu_index)
     return transcript_to_md(
         transcript_path=transcript_path,
         output_md=output_md,
         ollama_model=ollama_model,
         use_llm=use_llm,
         output_dir=output_dir,
+        split_chars=split_chars,
     )
 
 
@@ -125,12 +164,21 @@ if __name__ == "__main__":
     parser.add_argument("--interval", "-i", type=float, default=10.0,
                         help="Frame capture interval (default: 10.0)")
     parser.add_argument("--llm", default=DEFAULT_OLLAMA_MODEL,
-                        help=f"Ollama model (default: {DEFAULT_OLLAMA_MODEL})")
+                        help=f"Ollama model: auto (default, el mejor "
+                             f"instalado que quepa en este equipo) o el nombre "
+                             f"exacto (default: {DEFAULT_OLLAMA_MODEL})")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip Ollama analysis (transcription + frames only)")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
                         help="Device para Whisper: auto (default), cpu (seguro en "
                              "portátiles) o cuda")
+    parser.add_argument("--ollama-gpu", choices=OLLAMA_GPU_MODES, default="auto",
+                        help="Dónde corre el LLM: auto (default; GPU si la "
+                             "tarjeta es potente y no está caliente), gpu o "
+                             "cpu. La protección por temperatura siempre manda.")
+    parser.add_argument("--ollama-gpu-index", default=None,
+                        help="Índice de la GPU para el LLM (auto = la que "
+                             "elija Ollama)")
     parser.add_argument("--cookies", default=None,
                         help="Ruta a un archivo de cookies (Netscape) para "
                              "descargas con login")
@@ -152,6 +200,8 @@ if __name__ == "__main__":
             ollama_model=args.llm,
             use_llm=not args.no_llm,
             output_dir=args.output_dir,
+            ollama_gpu=args.ollama_gpu,
+            ollama_gpu_index=args.ollama_gpu_index,
         )
     elif args.video:
         md = analyze_video(
@@ -168,6 +218,8 @@ if __name__ == "__main__":
             cookies=args.cookies,
             cookies_from_browser=args.cookies_from_browser,
             live_from_start=args.live_from_start,
+            ollama_gpu=args.ollama_gpu,
+            ollama_gpu_index=args.ollama_gpu_index,
         )
     else:
         parser.error("Especifica --video o --transcript")

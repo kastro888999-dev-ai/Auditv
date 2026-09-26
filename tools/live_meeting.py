@@ -16,8 +16,12 @@ Audio sources (PipeWire/PulseAudio):
 
 Usage:
     ./venv/bin/python tools/live_meeting.py --list-sources
-    ./venv/bin/python tools/live_meeting.py --source auto --model base --notes
+    ./venv/bin/python tools/live_meeting.py --source auto --notes
     ./venv/bin/python tools/live_meeting.py --source alsa_output...monitor -o "informes/reunion.txt"
+
+El modelo, el dispositivo y la GPU se detectan solos (--model/--device auto):
+si el equipo aguanta la GPU se usa y, si se calienta durante la reunión, la
+tarjeta descansa y la transcripción continúa en CPU sin perder nada.
 
 Stop the capture with Ctrl+C; the transcript is saved and (with --notes) the
 apuntes report is generated automatically.
@@ -25,8 +29,6 @@ apuntes report is generated automatically.
 
 import argparse
 import datetime
-import os
-import re
 import signal
 import subprocess
 import sys
@@ -41,7 +43,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from video_to_md import (  # noqa: E402
     transcript_to_md,
+    detect_device,
+    resolve_whisper_model,
     DEFAULT_OLLAMA_MODEL,
+    DEFAULT_WHISPER_MODEL,
+    GUARD,
     log,
 )
 
@@ -50,6 +56,8 @@ CHUNK_SEC = 4.0          # seconds of audio transcribed per call
 OVERLAP_SEC = 0.8        # overlap between chunks to keep words across borders
 SILENCE_RMS = 120.0      # int16 RMS below this is treated as silence
 MAX_CHARS = 8000         # cap fed to the notes analyzer
+# Cada cuánto se mira la temperatura de la GPU durante una reunión larga.
+GPU_CHECK_EVERY = 10     # chunks (~40 s)
 
 
 def list_sources() -> list:
@@ -96,13 +104,15 @@ def main(argv=None) -> int:
                         help="Fuente de audio: nombre del dispositivo "
                              "(pactl), 'auto' (monitor de sistema si existe) "
                              "o 'default'")
-    parser.add_argument("--model", default="base",
-                        help="Modelo Whisper: tiny/base/small/medium/large "
-                             "(base recomendado en CPU para tiempo real)")
+    parser.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
+                        help="Modelo Whisper: auto (default, elige según tu "
+                             "equipo) o tiny/base/small/medium/large")
     parser.add_argument("--language", default="es", help="Idioma (default: es)")
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
-                        help="Device de Whisper (default: cpu para no calentar "
-                             "la GPU durante una reunión larga)")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"),
+                        default="auto",
+                        help="Device de Whisper: auto (default, usa la GPU solo "
+                             "si el equipo y la temperatura lo permiten), cpu "
+                             "o cuda")
     parser.add_argument("-o", "--output", default=None,
                         help="Ruta de la transcripción .txt (default: "
                              "'(cwd)/reunion_live_<timestamp>.txt')")
@@ -110,7 +120,8 @@ def main(argv=None) -> int:
                         help="Al terminar (Ctrl+C) generar el informe de "
                              "apuntes (_apuntes.md) con Ollama")
     parser.add_argument("--llm", default=DEFAULT_OLLAMA_MODEL,
-                        help=f"Modelo Ollama para los apuntes "
+                        help=f"Modelo Ollama para los apuntes: auto (default, "
+                             f"el mejor instalado que quepa) o el nombre exacto "
                              f"(default: {DEFAULT_OLLAMA_MODEL})")
     parser.add_argument("--list-sources", action="store_true",
                         help="Listar fuentes de audio disponibles y salir")
@@ -139,7 +150,11 @@ def main(argv=None) -> int:
         txt_path = str(Path.cwd() / f"reunion_live_{timestamp}.txt")
     Path(txt_path).parent.mkdir(parents=True, exist_ok=True)
 
-    model = whisper.load_model(args.model, device=args.device)
+    # 'auto' decide con el mismo criterio que el resto del proyecto: si el
+    # equipo aguanta la GPU se usa, y si no, CPU (más lento pero seguro).
+    device = detect_device(args.device)
+    model_name = resolve_whisper_model(args.model, device, duration_s=None)
+    model = whisper.load_model(model_name, device=device)
 
     ffmpeg_cmd = [
         "ffmpeg", "-loglevel", "error", "-nostdin",
@@ -176,11 +191,12 @@ def main(argv=None) -> int:
     )
 
     segment_count = 0
+    chunks_done = 0
     try:
         with open(txt_path, "w", encoding="utf-8") as fh:
             fh.write(f"# Reunión en vivo — {timestamp}\n")
             fh.write(f"- Fuente: {src}\n")
-            fh.write(f"- Modelo Whisper: {args.model} ({args.device})\n\n")
+            fh.write(f"- Modelo Whisper: {model_name} ({device})\n\n")
             fh.flush()
 
             while not stop["flag"]:
@@ -199,6 +215,23 @@ def main(argv=None) -> int:
                 if rms_int16(chunk) < args.silence:
                     continue
 
+                # Una reunión puede durar horas: si la GPU se calienta, se la
+                # deja descansar y el resto de la reunión sigue en CPU (la
+                # transcripción no se corta ni se pierde nada).
+                if device == "cuda" and chunks_done % GPU_CHECK_EVERY == 0:
+                    was_resting = GUARD.resting
+                    if GUARD.should_use_gpu("transcripción en vivo"):
+                        if was_resting:
+                            model.to("cuda")
+                            device = "cuda"
+                            log("GPU recuperada: la transcripción vuelve a la "
+                                "GPU.", "GPU")
+                    else:
+                        model.to("cpu")
+                        device = "cpu"
+                        log("GPU en descanso: la transcripción sigue en CPU "
+                            "(no se pierde nada).", "GPU")
+
                 audio = chunk.astype(np.float32) / 32768.0
                 result = model.transcribe(
                     audio,
@@ -207,6 +240,7 @@ def main(argv=None) -> int:
                     condition_on_previous_text=False,
                 )
                 text = (result.get("text") or "").strip()
+                chunks_done += 1
                 if not text or result.get("no_speech_prob", 0) > 0.6:
                     continue
 
@@ -228,7 +262,10 @@ def main(argv=None) -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    log(f"Transcripción guardada: {txt_path} ({segment_count} segmentos)")
+    log(
+        f"Transcripción guardada: {txt_path} ({segment_count} segmentos, "
+        f"Whisper {model_name} en {device.upper()})"
+    )
 
     if args.notes:
         log("Generando informe de apuntes con Ollama...")

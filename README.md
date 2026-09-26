@@ -10,7 +10,9 @@ Herramienta que convierte un video en un informe Markdown estructurado:
 
 - `ffmpeg` instalado (extracción de audio y frames)
 - `ollama` corriendo en `http://localhost:11434` (para el análisis de ideas)
-- Un modelo local en Ollama (ya tienes `qwen3.5:4b`)
+- Al menos un modelo descargado en Ollama (`ollama pull qwen3.5:4b` o el que
+  prefieras). **No hace falta saber cuál**: con `--llm auto` (por defecto) se
+  detectan los tuyos y se elige el mejor que quepa en tu equipo.
 
 ## Instalación
 
@@ -38,11 +40,14 @@ Opciones:
 | `--output / -o` | Ruta del `.md` de salida | `<video>_analysis.md` |
 | `--output-dir` | Directorio base para el `.md` y los frames | junto al video (URLs: `informes/`) |
 | `--frames-dir` | Directorio explícito para los frames | `<output-dir>/frames_<video>` |
-| `--model / -m` | Tamaño del modelo Whisper (`base`, `small`, `medium`, `large`) | `small` |
+| `--model / -m` | Modelo Whisper: `auto` (elige según tu equipo y la duración del audio) o `tiny`/`base`/`small`/`medium`/`large`/`large-v3`/`large-v3-turbo` | `auto` |
 | `--interval / -i` | Segundos entre frames capturados | `10` |
 | `--no-frames` | No extraer frames (solo transcripción + análisis). Los archivos de **solo audio** (mp3, m4a, wav, ogg, opus, flac, aac…) se transcriben igual y los frames se omiten automáticamente | `off` |
-| `--llm` | Modelo de Ollama para el análisis | `qwen3.5:4b` |
+| `--llm` | Modelo de Ollama: `auto` (el mejor instalado que quepa en tu equipo) o el nombre exacto (`qwen3:8b`, `gemma3:4b`, …) | `auto` |
 | `--device` | Dispositivo para Whisper: `auto`, `cpu` (seguro en portátiles) o `cuda` | `auto` |
+| `--ollama-gpu` | Dónde corre el LLM: `auto` (GPU si la tarjeta es potente y no está caliente, si no CPU), `gpu` (forzada, con la protección térmica) o `cpu` | `auto` |
+| `--ollama-gpu-index` | Índice de la GPU para el LLM (`auto` = la que elija Ollama) | `auto` |
+| `--gpu-temp-warn` / `--gpu-temp-abort` / `--gpu-temp-resume` | Umbrales de temperatura (°C) de aviso, descanso y vuelta al trabajo | `80` / `92` / `75` |
 | `--cookies` | Archivo de cookies (Netscape) para descargas con login | — |
 | `--cookies-from-browser` | Reutiliza cookies de un navegador (`chrome`, `firefox`, `chromium`, con `:perfil` opcional) para plataformas donde estás logeado | — |
 | `--live-from-start` | Si la URL es un directo soportado, descarga desde el inicio de la transmisión | `off` |
@@ -54,14 +59,43 @@ Opciones:
 ./analyze_video.sh video.mp4 [output.md] [model] [interval]
 ```
 
+`model` e `interval` valen `auto`/`10` por defecto, así que lo normal es
+`./analyze_video.sh video.mp4`.
+
 ### Desde Python (función importable)
 
 ```python
 from tools.video_analyzer import analyze_video
 
+md = analyze_video("/ruta/video.mp4")            # todo se detecta solo
 md = analyze_video("/ruta/video.mp4", whisper_model="small", frame_interval=10)
 print(md)  # ruta del markdown generado
 ```
+
+## Detección automática de hardware y modelos
+
+Nada está atado a una máquina concreta: al arrancar, el programa pregunta al
+sistema qué hay (`hardware.py`) y decide con esa información.
+
+**Modelos de Ollama** (`--llm auto`, por defecto): lista los que tienes
+instalados y elige el más grande que **cabe cómodo** en tu equipo — con ~65 %
+de la VRAM si el LLM va a la GPU (ideal ~8B), o ~4,5 GB de RAM si va en CPU
+(ideal ~4B). Entre los que empatan, se prefieren las familias que siguen mejor
+las instrucciones y el JSON (`qwen`, `gemma3`, `llama3.3`…).
+
+**Modelo de Whisper** (`--model auto`, por defecto): el mayor que quepa en
+~75 % de la VRAM si el device acaba siendo `cuda`; en CPU se elige según la
+duración del audio (`small` hasta 15 min, `base` hasta 45 min, `tiny` para
+horas, donde la diferencia de tiempo es enorme).
+
+**Device** (`--device auto`): la GPU solo se usa si este PyTorch la soporta de
+verdad. Una GTX 1060 (sm_61), por ejemplo, cae siempre a CPU con los builds
+actuales de torch, aunque la tarjeta pueda ejecutar el LLM de Ollama.
+
+**Potencia de la GPU**: se clasifica en `débil` / `media` / `potente` /
+`muy_potente` según VRAM y compute capability. El LLM va a la GPU por defecto a
+partir de `media`; con una GPU débil o sin GPU va a CPU para no recalentar el
+equipo. Se puede forzar con `--ollama-gpu gpu|cpu` o en la GUI.
 
 ## Salida (estructura del .md)
 
@@ -70,6 +104,7 @@ print(md)  # ruta del markdown generado
 - Generado: <fecha>
 - Modelo Whisper: small (cuda|cpu)
 - Modelo LLM: qwen3.5:4b
+- Motor: <descripción del equipo y de dónde corrieron Whisper y el LLM>
 
 ## 🏷️ Título sugerido
 ## 📌 Resumen ejecutivo
@@ -118,14 +153,18 @@ analiza el archivo resultante.
 
 | Variable | Default | Descripción |
 |----------|---------|-------------|
-| `OLLAMA_MODEL` | `qwen3.5:4b` | Modelo de Ollama |
-| `WHISPER_MODEL` | `small` | Modelo Whisper por defecto |
+| `OLLAMA_MODEL` | `auto` | Modelo de Ollama (`auto` = el mejor instalado que quepa) |
+| `WHISPER_MODEL` | `auto` | Modelo Whisper (`auto` = el adecuado al equipo y al audio) |
 | `OLLAMA_URL` | `http://localhost:11434` | URL del servidor Ollama |
-| `OLLAMA_NUM_CTX` | `4096` | Contexto (tokens) para el análisis con Ollama |
-| `OLLAMA_NUM_GPU` | `0` (CPU) | `0` = LLM solo CPU (no calienta la GPU, seguro); `1`/`-1` = usa la GPU si el equipo aguanta |
+| `OLLAMA_NUM_CTX` | `auto` | Contexto (tokens) para el análisis con Ollama (`auto` = 4096, o 8192 si hay VRAM de sobra) |
+| `OLLAMA_NUM_GPU` | `auto` | `auto` = GPU si la tarjeta es potente y está fría; `-1` = forzar GPU; `0` = solo CPU |
+| `OLLAMA_GPU_INDEX` | (auto) | Índice de la GPU para el LLM (`main_gpu` de Ollama) |
 | `OLLAMA_NUM_THREADS` | (sin usar) | Limitar hilos del LLM |
 | `AUDITV_DEVICE` | `auto` | Igual que `--device` (`auto`/`cpu`/`cuda`) |
-| `AUDITV_GPU_TEMP_WARN` / `AUDITV_GPU_TEMP_ABORT` | `80` / `92` | Temperatura GPU (°C) de aviso / aborto preventivo |
+| `AUDITV_GPU_TEMP_WARN` / `AUDITV_GPU_TEMP_ABORT` / `AUDITV_GPU_TEMP_RESUME` | `80` / `92` / `75` | Temperatura GPU (°C) de aviso, de descanso y de vuelta al trabajo |
+| `AUDITV_GPU_TEMP_INTERVAL` | `5` | Segundos entre mediciones de temperatura |
+| `AUDITV_TRANSCRIBE_CHUNK_SEC` | `300` | Tamaño (s) de los lotes de audio en GPU (para poder descansar la tarjeta) |
+| `AUDITV_STATUS_FILE` | (vacío) | Fichero JSON de estado que escribe el CLI; la GUI lo usa para pintar el panel de GPU |
 | `AUDITV_DOWNLOAD_DIR` | `descargas/` en el proyecto | Carpeta donde se descargan los videos de URLs |
 | `AUDITV_OUTPUT_DIR` | `informes/` en el proyecto | Carpeta base por defecto para las salidas de URLs |
 
@@ -139,21 +178,23 @@ del modo `--transcript`.
 
 ```bash
 ./venv/bin/python tools/live_meeting.py --list-sources
-./venv/bin/python tools/live_meeting.py --source auto --model base --notes -o "informes/reunion.txt"
+./venv/bin/python tools/live_meeting.py --source auto --notes -o "informes/reunion.txt"
 ```
 
 Cómo funciona:
 - Captura el audio del **sistema** (`.monitor`, lo que suena por los altavoces:
   ideal para Meet/Teams/Zoom en el navegador) o del **micrófono** (`alsa_input`),
   con ffmpeg sobre PipeWire/PulseAudio.
-- Transcribe en trozos de ~4 s con Whisper (`base` en CPU por defecto; evita
-  calentar la GPU en reuniones largas) y escribe cada frase con su `[MM:SS]`.
+- Transcribe en trozos de ~4 s con Whisper y escribe cada frase con su
+  `[MM:SS]`. El modelo y el device se detectan solos (`--model auto`,
+  `--device auto`); si la GPU se calienta durante la reunión, la tarjeta
+  descansa y el resto se transcribe en CPU sin cortar la captura.
 - `Ctrl+C` guarda la transcripción y (si usas `--notes`) genera los apuntes.
 - Al final la transcripción se puede reprocesar cuando quieras:
-  `./analyze_video.sh "" "" small 15 --transcript reunion.txt --output-dir informes`.
+  `./analyze_video.sh "" "" auto 15 --transcript reunion.txt --output-dir informes`.
 
 No añade dependencias: usa ffmpeg + openai-whisper, que ya requiere el
-proyecto. En hardware muy limitado puedes empezar con `--model tiny`.
+proyecto. En hardware muy limitado puedes forzar `--model tiny --device cpu`.
 
 ## Interfaz gráfica (Gradio)
 
@@ -181,12 +222,20 @@ Tiene tres pestañas:
   captura, ves la transcripción en tiempo real, la detienes con un botón y
   generas los apuntes automáticamente.
 
+Encima de las pestañas hay un **panel de GPU** que se actualiza cada 2 s:
+nombre de la tarjeta, VRAM libre, temperatura (verde/naranja/rojo según los
+umbrales) y un indicador de estado —`en uso`, `en descanso`, `libre` o
+`no detectada`— para saber si la GPU está trabajando o no. Además indica qué
+modelo de Whisper y de IA local se han elegido y en qué device corren.
+
 La interfaz ejecuta los mismos scripts (`video_to_md.py` y
 `live_meeting.py`), así que no hay lógica duplicada.
 
 Detalles de la interfaz:
-- **Modelo de IA local**: selector desplegable que lista los modelos de tu
-  Ollama local (botón `↻ Actualizar modelos` para recargar).
+- **Todo es `auto` por defecto**: el desplegable de modelos de Ollama se llena
+  con los que tienes instalados (`auto` + botón `↻ Actualizar modelos`), el de
+  Whisper muestra el recomendado para tu equipo, y «Dónde corre la IA» trae
+  `auto`/`gpu`/`cpu` con la recomendación de tu hardware en la descripción.
 - **Seleccionar Carpeta de Guardado**: botón que abre el selector nativo de
   carpetas del escritorio (KDE/GNOME/Windows) en cada campo de salida.
 - La barra inferior de Gradio (Run, API, configuración) se muestra arriba,
@@ -234,19 +283,31 @@ En portátiles con refrigeración justa (p. ej. GTX 1060 Mobile) el análisis
 LLM de Ollama sobre la GPU puede disparar la temperatura y **apagar el equipo
 a mitad de la ejecución**. Para evitarlo la herramienta:
 
-- Monitorea la temperatura de la GPU (`nvidia-smi`): avisa desde 80°C
-  (ajustable con `AUDITV_GPU_TEMP_WARN`). Si alcanza 92°C
-  (`AUDITV_GPU_TEMP_ABORT`) durante una consulta LLM, **esa consulta y las
-  siguientes se reintentan en CPU** en vez de abortar, para que ningún bache
-  se quede sin resumen/conclusiones.
+- Mide la temperatura de la GPU (`nvidia-smi`) **cada 5 segundos**
+  (`AUDITV_GPU_TEMP_INTERVAL`). Avisa desde 80 °C (`AUDITV_GPU_TEMP_WARN`).
+- Al llegar a 92 °C (`AUDITV_GPU_TEMP_ABORT`) la GPU **entra en descanso**: se
+  suelta el modelo de Ollama de la VRAM (`keep_alive=0`) y el lote actual
+  **termina en CPU sin perder su resultado**. Los lotes siguientes también van
+  en CPU, y en cuanto la tarjeta baja de 75 °C (`AUDITV_GPU_TEMP_RESUME`)
+  el trabajo **vuelve a la GPU** solo (histéresis, para no oscilar).
+- La transcripción en GPU va **por lotes de 5 minutos**
+  (`AUDITV_TRANSCRIBE_CHUNK_SEC`): entre lote y lote se comprueba la
+  temperatura, así que si se calienta, el lote en curso y los siguientes se
+  terminan en CPU. Cada lote se guarda en un checkpoint
+  (`_transcripcion.txt`) al terminar.
 - Guarda la transcripción (`_transcripcion.txt`) y un **informe parcial** con
   transcripción + frames ANTES de empezar el análisis con Ollama, para no
   perder progreso si el equipo se apaga.
-- Usa 4096 tokens de contexto por defecto (antes 8192).
+- La GUI lo enseña todo en el panel de GPU: temperatura, si la tarjeta está en
+  descanso y por qué, y en qué device corre cada cosa.
+- Contexto de Ollama ajustado al equipo (4096 tokens, 8192 si hay VRAM de
+  sobra) en vez de 8192 fijos.
 
-Si el PC se apagó o está caliente, reejecuta con menos carga de GPU:
+Si el PC se apagó o está caliente, baja el listón explícitamente:
 
 ```bash
-AUDITV_GPU_TEMP_WARN=75 OLLAMA_NUM_GPU=0 OLLAMA_NUM_CTX=2048 \
-  ./analyze_video.sh video.mp4 informe.md tiny 15 --autoclean keep --device cpu
+AUDITV_GPU_TEMP_WARN=75 ./analyze_video.sh video.mp4 informe.md auto 15 \
+  --autoclean keep --device cpu --ollama-gpu cpu
 ```
+
+Y si solo quieres que decida él: no pases nada y usa `auto` (lo normal).

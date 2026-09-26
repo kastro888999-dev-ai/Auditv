@@ -12,6 +12,7 @@ frames_*/
 *_analysis.md
 descargas/
 informes/
+.auditv_status.json
 
 # OS
 .DS_Store

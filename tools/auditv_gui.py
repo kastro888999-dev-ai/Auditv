@@ -12,14 +12,21 @@ Interfaz web local para el pipeline completo del proyecto:
                             real (audio del sistema o micrófono) y generar
                             los apuntes al cerrar.
 
+En todas las pestañas hay un panel de equipo arriba: qué GPU ha encontrado,
+su temperatura y si la está usando ahora mismo. Los modelos, el dispositivo y
+la GPU del LLM se detectan solos (ver hardware.py), así que nada queda atado
+a una máquina concreta.
+
 Ejecutar:
     ./venv/bin/python tools/auditv_gui.py
 Se abre en el navegador en http://127.0.0.1:7860
 """
 
+import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -28,10 +35,17 @@ import gradio as gr
 _PROJECT = Path(__file__).resolve().parent.parent
 _PY = str(_PROJECT / "venv" / "bin" / "python")
 _CLI = str(_PROJECT / "video_to_md.py")
-_LIVE = str(_PROJECT / "tools" / "live_meeting.py")
+_LIVE_SCRIPT = str(_PROJECT / "tools" / "live_meeting.py")
+
+# El módulo `hardware` vive en la raíz del proyecto: se importa para no
+# duplicar (ni volver a endurecer) la detección de GPU/modelos.
+if str(_PROJECT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT))
+import hardware  # noqa: E402
 
 _DEFAULT_OUTDIR = str(_PROJECT / "informes")
-_OLLAMA_MODELS = ["qwen3.5:4b"]
+# Fichero de estado que escribe el CLI y lee este panel (ver video_to_md.py).
+_STATUS_FILE = str(_PROJECT / ".auditv_status.json")
 
 _LIVE = {"proc": None, "txt": None}
 
@@ -123,42 +137,195 @@ def on_cancel(key: str) -> str:
             else "No hay proceso de ese tipo en ejecución.")
 
 
-def _ollama_env(use_gpu: bool, gpu_idx: str) -> dict:
-    """Entorno para el subproceso CLI: activa GPU para el LLM y elige cuál.
+def _gpu_mode(value) -> str:
+    """Normaliza el selector de "dónde corre el LLM" a auto | gpu | cpu.
 
-    OLLAMA_NUM_GPU -> cuántas capas va a la GPU (1/-1 = GPU, 0 = CPU).
-    OLLAMA_GPU_INDEX -> main_gpu (índice) que se envía en la consulta.
-    CUDA_VISIBLE_DEVICES -> índice visible también para Whisper (torch).
+    Acepta también un checkbox booleano (compatibilidad) y, si el valor es
+    None, cae en 'auto' (decide el CLI según la potencia de la GPU).
+    """
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        return "gpu" if value else "cpu"
+    mode = str(value).strip().lower()
+    return mode if mode in ("auto", "gpu", "cpu") else "auto"
+
+
+def _gpu_index(gpu_idx: str, mode: str) -> str:
+    """Índice de GPU a usar ('' = que lo elija Ollama/torch).
+
+    Si el LLM va en CPU el índice no aplica, así que se ignora.
+    """
+    idx = (gpu_idx or "auto").strip()
+    if _gpu_mode(mode) == "cpu":
+        return ""
+    return idx if idx not in ("", "auto") else ""
+
+
+def _ollama_env(mode, gpu_idx: str) -> dict:
+    """Entorno para el subproceso CLI.
+
+    OLLAMA_NUM_GPU        -> cuántas capas van a la GPU ("auto" = que decida el
+                             CLI según la potencia de la tarjeta, "-1" = todas).
+    OLLAMA_GPU_INDEX      -> main_gpu (índice) que se envía en la consulta.
+    CUDA_VISIBLE_DEVICES  -> índice visible también para Whisper (torch).
+    AUDITV_STATUS_FILE    -> dónde escribir el estado que pinta el panel de GPU.
     """
     env = dict(os.environ)
-    if use_gpu:
-        env["OLLAMA_NUM_GPU"] = "-1"  # -1 = tantas capas como quepan en la GPU
-    else:
-        env["OLLAMA_NUM_GPU"] = "0"
-    idx = (gpu_idx or "auto").strip()
-    if use_gpu and idx not in ("", "auto"):
+    env["OLLAMA_NUM_GPU"] = {"auto": "auto", "gpu": "-1", "cpu": "0"}[_gpu_mode(mode)]
+    idx = _gpu_index(gpu_idx, mode)
+    if idx:
         env["OLLAMA_GPU_INDEX"] = idx
         env["CUDA_VISIBLE_DEVICES"] = idx
     else:
         env.pop("OLLAMA_GPU_INDEX", None)
-        if "CUDA_VISIBLE_DEVICES" in env and not use_gpu:
-            env.pop("CUDA_VISIBLE_DEVICES", None)
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    env["AUDITV_STATUS_FILE"] = _STATUS_FILE
     return env
 
 
 def list_gpu_indices() -> list:
-    """Devuelve ['auto', '0', '1', ...] con las GPUs NVIDIA detectadas."""
+    """['auto', '0', '1', ...] con las GPUs NVIDIA detectadas."""
+    gpus = hardware.gpu_infos()
+    return ["auto"] + [str(g["index"]) for g in gpus] if gpus else ["auto"]
+
+
+def _gpu_args(mode, gpu_idx: str) -> list:
+    """Argumentos de CLI para decidir dónde corre el LLM de Ollama."""
+    args = ["--ollama-gpu", _gpu_mode(mode)]
+    idx = _gpu_index(gpu_idx, mode)
+    if idx:
+        args += ["--ollama-gpu-index", idx]
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Estado del proceso (lo escribe el CLI) y panel de GPU
+# ---------------------------------------------------------------------------
+def read_status() -> dict:
+    """Lee el JSON de estado del CLI ([] si aún no ha escrito nada)."""
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5
-        )
-        if out.returncode != 0:
-            return ["auto"]
-        gpus = [l for l in out.stdout.splitlines()
-                if l.strip().lower().startswith("gpu ")]
-        return ["auto"] + [str(i) for i in range(len(gpus))]
+        data = json.loads(Path(_STATUS_FILE).read_text(encoding="utf-8"))
     except Exception:
-        return ["auto"]
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clear_status() -> None:
+    """Borra el estado de la ejecución anterior (al empezar algo nuevo)."""
+    try:
+        Path(_STATUS_FILE).unlink()
+    except OSError:
+        pass
+
+
+def _fmt_temp(temp, warn=None, abort=None) -> tuple:
+    """(texto, color) con la temperatura ya coloreada según los umbrales."""
+    if temp is None:
+        return "—", "var(--body-text-color-subdued)"
+    if abort is not None and temp >= abort:
+        return f"{temp:.0f}°C", "#e03131"
+    if warn is not None and temp >= warn:
+        return f"{temp:.0f}°C", "#e8590c"
+    return f"{temp:.0f}°C", "#2f9e44"
+
+
+def gpu_panel_html() -> str:
+    """Panel de GPU/equipo: qué tarjeta hay, su temperatura y si se está usando.
+
+    Se refresca cada 2 s con un Timer. El estado de la ejecución (qué está
+    usando la GPU ahora) viene del fichero que escribe el CLI; la temperatura
+    se lee aquí directo, para que también se vea con la app en reposo.
+    """
+    st = read_status()
+    gpus = hardware.gpu_infos()
+    gpu = hardware.primary_gpu(gpus)
+    thresholds = st.get("thresholds") or {}
+    warn = thresholds.get("warn")
+    abort = thresholds.get("abort")
+    resume = thresholds.get("resume")
+    running = bool(st.get("running"))
+    resting = bool(st.get("gpu_resting"))
+
+    if gpu:
+        temp, temp_color = _fmt_temp(st.get("gpu_temp") or gpu.get("temp_c"),
+                                     warn, abort)
+        if resting:
+            state, state_color = "en descanso (caliente)", "#e8590c"
+        elif running and (st.get("llm_device") == "GPU"
+                          or st.get("whisper_batch_device") == "GPU"
+                          or (st.get("llm_device") is None and gpu.get("util_pct"))):
+            state, state_color = "en uso", "#2f9e44"
+        elif running:
+            state, state_color = "libre (trabajando en CPU)", "var(--body-text-color-subdued)"
+        else:
+            state, state_color = "libre", "var(--body-text-color-subdued)"
+        detail = f"{hardware.describe_gpu(gpu)}"
+        util = gpu.get("util_pct")
+        if util is not None:
+            detail += f" · {util} % de uso"
+        free = hardware.gpu_free_mb(gpu)
+        detail += f" · {hardware.fmt_vram(free)} libres"
+    else:
+        temp, temp_color = "—", "var(--body-text-color-subdued)"
+        state, state_color = "no detectada", "var(--body-text-color-subdued)"
+        detail = "No hay GPU NVIDIA detectable: todo irá en CPU."
+
+    # Qué equipo de transcripción y de análisis se ha elegido en esta ejecución.
+    wdev = st.get("whisper_device") or st.get("device")
+    wmodel = st.get("whisper_model")
+    ldev = st.get("llm_device")
+    lmodel = st.get("llm_model")
+    auto_mark = " (auto)" if st.get("whisper_model_auto") else ""
+    llm_mark = " (auto)" if st.get("llm_model_auto") else ""
+    pending = " (pendiente)"
+    if not st:
+        # Todavía no ha corrido nada: se enseña lo que se usaría con «auto».
+        info = hardware.torch_cuda_info()
+        wdev = "cuda" if info.get("usable") else "cpu"
+        wmodel = hardware.recommend_whisper_model(wdev, info.get("vram_mb"))
+        lmodel, _best = hardware.pick_ollama_model()
+        ldev = "GPU" if hardware.ollama_gpu_default()[0] else "CPU"
+        auto_mark = llm_mark = pending
+
+    rows = [
+        ("Whisper", f"{wmodel or '—'}{auto_mark}" + (f" · {wdev.upper()}"
+         if wdev else "")),
+        ("IA local", f"{lmodel or '—'}{llm_mark}" + (f" · {ldev}"
+         if ldev else "")),
+    ]
+    stage = st.get("stage") or ""
+    batch = st.get("batch") or st.get("whisper_batch") or ""
+    if running and stage:
+        rows.insert(0, ("Ahora", " · ".join(x for x in (stage, batch) if x)))
+
+    table = "".join(
+        f"<tr><td style='padding:1px 8px 1px 0;opacity:.7'>{k}</td>"
+        f"<td style='padding:1px 0'>{v}</td></tr>"
+        for k, v in rows
+    )
+    limits = (f"aviso {warn}°C · descanso {abort}°C · retoma a {resume}°C"
+              if None not in (warn, abort, resume) else
+              "protección por temperatura activa")
+    if resting and st.get("gpu_rest_reason"):
+        limits += f"<br><span style='color:#e8590c'>{st['gpu_rest_reason']}"
+        limits += " — los lotes siguen en CPU, sin perder nada.</span>"
+
+    return f"""<div style="border:1px solid rgba(128,128,128,.25);border-radius:8px;
+  padding:.5rem .75rem;margin-bottom:.5rem;font-size:.92em;line-height:1.35">
+  <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
+    <span style="font-weight:600">🎮 GPU</span>
+    <span>{detail}</span>
+    <span style="color:{temp_color};font-weight:600">🌡 {temp}</span>
+    <span style="color:{state_color}">● {state}</span>
+    <span style="opacity:.6;font-size:.85em">{limits}</span>
+  </div>
+  <table style="border-collapse:collapse;margin-top:.25rem">{table}</table>
+</div>"""
+
+
+def refresh_gpu_panel() -> str:
+    return gpu_panel_html()
 
 
 def _run_cli_streaming(args, key="video", env=None):
@@ -206,26 +373,73 @@ def _read_tail(path: str, max_chars: int = 30000) -> str:
 
 
 def list_ollama_models() -> list:
-    """Return the locally available Ollama models (via local API)."""
-    import json
+    """Modelos instalados en el Ollama local, con 'auto' al principio.
 
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(
-            "http://localhost:11434/api/tags", timeout=3
-        ) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        names = [m.get("name") for m in data.get("models", [])]
-        return names or ["qwen3.5:4b"]
-    except Exception:
-        return ["qwen3.5:4b"]
+    'auto' es el valor por defecto: el CLI elige el mejor que quepa en el
+    equipo (el mayor en GPU, ~4B en CPU), así que el usuario no necesita saber
+    qué tiene instalado.
+    """
+    models = hardware.ollama_models()
+    return ["auto"] + sorted(m["name"] for m in models)
 
 
-def _refresh_models() -> dict:
-    """Rebuild the Ollama model dropdown."""
-    choices = sorted(list_ollama_models())
-    return gr.update(choices=choices, value=choices[0])
+def _refresh_models():
+    """Recarga el desplegable de modelos de Ollama (respeta lo elegido)."""
+    choices = list_ollama_models()
+    return gr.update(choices=choices)
+
+
+def ollama_dropdown(label="Modelo de IA local (Ollama)"):
+    """Desplegable de Ollama: 'auto' + lo instalado, con valor recomendado."""
+    models = hardware.ollama_models()
+    auto, best = hardware.pick_ollama_model(models)
+    info = ""
+    if best:
+        info = f" (recomendado para este equipo: {auto}, " \
+               f"{hardware.model_size_gb(best):.1f} GB)"
+    elif not models:
+        info = " — Ollama no responde; el análisis LLM fallará"
+    return gr.Dropdown(
+        list_ollama_models(),
+        value="auto",
+        label=label + info,
+        allow_custom_value=True,
+        info="«auto» = el mejor modelo que tengas instalado que quepa en tu equipo.",
+    )
+
+
+def _whisper_dropdown(live: bool = False):
+    """Desplegable de Whisper con 'auto' (el modelo adecuado a este equipo)."""
+    rep = hardware.whisper_report(device="cpu")
+    choices = ["auto", "tiny", "base", "small", "medium"] if live \
+        else list(hardware.WHISPER_CHOICES)
+    cached = ", ".join(rep["cached"]) or "ninguno"
+    return gr.Dropdown(
+        choices,
+        value="auto",
+        label=f"Modelo Whisper (recomendado aquí: {rep['auto']})",
+        info=f"«auto» elige según tu GPU, la RAM y la duración del audio. "
+             f"Ya descargados: {cached}.",
+    )
+
+
+def _gpu_controls():
+    """Selector de dónde corre el LLM, preajustado a la potencia del equipo.
+
+    Devuelve (radio, desplegable de índice de GPU, botón de redetectar).
+    """
+    use_gpu, reason = hardware.ollama_gpu_default()
+    return (
+        gr.Radio(
+            ["auto", "gpu", "cpu"],
+            value="auto",
+            label="Dónde corre la IA (Ollama)",
+            info=(f"«auto» = recomendado aquí: "
+                  f"{'GPU' if use_gpu else 'CPU'}. {reason}"),
+        ),
+        gr.Dropdown(list_gpu_indices(), value="auto", label="GPU para la IA (índice)"),
+        gr.Button("↻ Detectar GPUs"),
+    )
 
 
 def pick_directory() -> str:
@@ -268,15 +482,16 @@ def on_run_video(
     if not video_arg:
         return ("Elige un video local (subir o ruta) o pega una URL.", "")
 
+    _clear_status()
     args = [
         "--video", video_arg,
         "--output-dir", outdir,
-        "--model", model,
+        "--model", model or "auto",
         "--interval", str(int(interval)),
-        "--llm", llm_m or "qwen3.5:4b",
+        "--llm", llm_m or "auto",
         "--autoclean", autoclean or "keep",
         "--device", device or "auto",
-    ]
+    ] + _gpu_args(llm_use_gpu, llm_gpu_sel)
     if no_llm:
         args.append("--no-llm")
     if not extract_frames_cb:
@@ -310,11 +525,12 @@ def on_transcript(t_file, t_path, t_outdir, t_llm, t_split, t_split_chars,
     outdir = (t_outdir or _DEFAULT_OUTDIR).strip()
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
+    _clear_status()
     args = [
         "--transcript", txt,
         "--output-dir", outdir,
-        "--llm", t_llm or "qwen3.5:4b",
-    ]
+        "--llm", t_llm or "auto",
+    ] + _gpu_args(t_llm_use_gpu, t_llm_gpu_sel)
     if t_split:
         args += ["--split-chars", str(int(t_split_chars or 6000))]
     yield from _run_cli_streaming(
@@ -332,8 +548,9 @@ def on_live_start(source, model, device, out_txt):
     Path(out_txt).parent.mkdir(parents=True, exist_ok=True)
     _LIVE["txt"] = out_txt
     _LIVE["proc"] = subprocess.Popen(
-        [_PY, _LIVE, "--source", source or "auto", "--model", model or "base",
-         "--device", device or "cpu", "-o", out_txt],
+        [_PY, _LIVE_SCRIPT, "--source", source or "auto",
+         "--model", model or "auto", "--device", device or "auto",
+         "-o", out_txt],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
     return f"Captura iniciada desde '{source or 'auto'}'. Escribe la transcripción en {out_txt}"
@@ -362,8 +579,13 @@ def on_live_notes():
     if not txt or not Path(txt).exists():
         yield ("No hay transcripción todavía. Inicia una captura y detenla al terminar.", "")
         return
-    args = ["--transcript", txt, "--output-dir", str(Path(txt).parent)]
-    yield from _run_cli_streaming(args, key="notes")
+    _clear_status()
+    use_gpu, _ = hardware.ollama_gpu_default()
+    args = ["--transcript", txt, "--output-dir", str(Path(txt).parent),
+            "--llm", "auto"] + _gpu_args(use_gpu, "auto")
+    yield from _run_cli_streaming(
+        args, key="notes", env=_ollama_env(use_gpu, "auto")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +593,8 @@ def on_live_notes():
 # ---------------------------------------------------------------------------
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="AuditV — Análisis de video y apuntes") as demo:
+        # Panel de equipo: qué GPU hay, su temperatura y si se está usando.
+        gpu_panel = gr.HTML(gpu_panel_html())
         with gr.Tab("Video / URL"):
             with gr.Row():
                 file_in = gr.File(
@@ -391,23 +615,16 @@ def build_app() -> gr.Blocks:
                 outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta de salida (informe + frames)")
                 outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
                 device = gr.Dropdown(["auto", "cpu", "cuda"], value="auto", label="Device")
-                model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="small", label="Modelo Whisper")
+                model = _whisper_dropdown()
             with gr.Row():
                 interval = gr.Slider(1, 60, value=10, step=1, label="Intervalo frames (s)")
                 autoclean = gr.Dropdown(["keep", "ask", "delete"], value="keep", label="Autoclean")
-                llm_m = gr.Dropdown(_OLLAMA_MODELS, value=_OLLAMA_MODELS[0], label="Modelo de IA local (Ollama)")
+                llm_m = ollama_dropdown()
                 llm_refresh = gr.Button("↻ Actualizar modelos")
                 no_llm = gr.Checkbox(label="Omitir análisis LLM")
                 extract_frames_cb = gr.Checkbox(value=True, label="Extraer frames")
             with gr.Row():
-                llm_use_gpu = gr.Checkbox(
-                    value=False,
-                    label="Usar GPU para la IA (Ollama) — más rápido pero calienta más",
-                )
-                llm_gpu_sel = gr.Dropdown(
-                    list_gpu_indices(), value="auto", label="GPU para la IA (índice)"
-                )
-                llm_gpu_refresh = gr.Button("↻ Detectar GPUs")
+                llm_use_gpu, llm_gpu_sel, llm_gpu_refresh = _gpu_controls()
             with gr.Row():
                 cookies_browser = gr.Textbox(label="Cookies del navegador (chrome/firefox…)")
                 cookies_file = gr.Textbox(label="Archivo de cookies (ruta)")
@@ -445,21 +662,14 @@ def build_app() -> gr.Blocks:
                     with gr.Row():
                         t_outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta del informe")
                         t_outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
-                        t_llm = gr.Dropdown(_OLLAMA_MODELS, value=_OLLAMA_MODELS[0], label="Modelo de IA local (Ollama)")
+                        t_llm = ollama_dropdown()
                         t_llm_refresh = gr.Button("↻ Actualizar modelos")
             with gr.Row():
                 t_split = gr.Checkbox(value=True, label="Dividir texto en partes: .md por cada parte + informe fusionado (los textos largos se dividen solos; aquí fijas el tamaño)")
                 t_split_chars = gr.Number(value=6000, minimum=2000, maximum=20000,
                                           step=500, label="Caracteres por parte")
             with gr.Row():
-                t_llm_use_gpu = gr.Checkbox(
-                    value=False,
-                    label="Usar GPU para la IA (Ollama) — más rápido pero calienta más",
-                )
-                t_llm_gpu_sel = gr.Dropdown(
-                    list_gpu_indices(), value="auto", label="GPU para la IA (índice)"
-                )
-                t_llm_gpu_refresh = gr.Button("↻ Detectar GPUs")
+                t_llm_use_gpu, t_llm_gpu_sel, t_llm_gpu_refresh = _gpu_controls()
             with gr.Row():
                 t_btn = gr.Button("📝 Generar informe (_apuntes.md)", variant="primary")
             t_cancel = gr.Button("⏹ Cancelar", variant="stop")
@@ -491,8 +701,8 @@ def build_app() -> gr.Blocks:
                     value="auto",
                     label="Fuente de audio (auto = sistema/.monitor · alsa_input… = micrófono)",
                 )
-                live_model = gr.Dropdown(["tiny", "base", "small"], value="base", label="Modelo Whisper")
-                live_device = gr.Dropdown(["cpu", "cuda"], value="cpu", label="Device")
+                live_model = _whisper_dropdown(live=True)
+                live_device = gr.Dropdown(["auto", "cpu", "cuda"], value="auto", label="Device")
             with gr.Row():
                 live_out = gr.Textbox(
                     value=str(_PROJECT / "informes" / "reunion_live.txt"),
@@ -528,6 +738,10 @@ def build_app() -> gr.Blocks:
 
             timer = gr.Timer(1)
             timer.tick(on_live_refresh, outputs=[live_area])
+
+        # El panel de GPU se refresca cada 2 s (temperatura + estado del proceso).
+        panel_timer = gr.Timer(2.0)
+        panel_timer.tick(refresh_gpu_panel, outputs=[gpu_panel])
 
     return demo
 

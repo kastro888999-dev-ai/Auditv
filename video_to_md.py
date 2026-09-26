@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -23,38 +24,52 @@ import time
 import urllib.error
 import urllib.request
 import warnings
+import wave
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hardware  # noqa: E402  (detección agnóstica de GPU/modelos)
 
 # ---------------------------------------------------------------------------
 # Config / constants
 # ---------------------------------------------------------------------------
-DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b")
-DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+# "auto" = se elige solo según lo que haya instalado en esta máquina
+# (hardware.pick_ollama_model / hardware.recommend_whisper_model).
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "auto")
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "auto")
 DEFAULT_FRAME_INTERVAL = 10.0  # seconds between captured frames
 # Extensiones de archivos solo-audio (se transcriben igual pero sin frames).
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac", ".aac",
               ".wma", ".aif", ".aiff", ".m4b", ".m4p", ".ape", ".amr"}
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-# 4096 evita que el LLM local se desborde de la VRAM de GPUs pequeñas y evita
-# el apagado por sobrecalentamiento en portátiles.
-OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "4096"))
 # Tamaño de parte para el análisis por trozos de transcripciones largas
 # (unifica el flujo de video y de apuntes; ~6000 chars = JSON completo en ctx 4096).
 ANALYSIS_PART_CHARS = int(os.environ.get("AUDITV_ANALYZE_PART_CHARS", "6000"))
-# 0 = Ollama solo CPU (más lento pero NO calienta la GPU; evita el apagado
-# por temperatura en portátiles con refrigeración justa). Pon 1/-1 para que
-# Ollama use la GPU si tu equipo lo aguanta.
-OLLAMA_NUM_GPU = os.environ.get("OLLAMA_NUM_GPU", "0")
+# auto = Ollama a la GPU si la tarjeta es lo bastante potente (y la temperatura
+# lo permite), si no a CPU. "1"/"-1" fuerza GPU, "0" fuerza CPU.
+OLLAMA_NUM_GPU = os.environ.get("OLLAMA_NUM_GPU", "auto")
 # Índice de la GPU que debe usar el LLM (main_gpu). None = auto/la de Ollama.
 OLLAMA_GPU_INDEX = os.environ.get("OLLAMA_GPU_INDEX")
 OLLAMA_NUM_THREADS = os.environ.get("OLLAMA_NUM_THREADS")
 # auto|cpu|cuda: forzar Whisper a CPU evita picos de carga en la GPU.
 DEVICE_HINT = os.environ.get("AUDITV_DEVICE", "auto")
 # Guardas de temperatura de la GPU (nvidia-smi). Warn por encima de WARN,
-# aborto preventivo por encima de ABORT para proteger el hardware.
+# reposo por encima de ABORT (ese bache y los siguientes van a CPU hasta que
+# la tarjeta baje de RESUME) para proteger el hardware.
 GPU_TEMP_WARN = int(os.environ.get("AUDITV_GPU_TEMP_WARN", "80"))
 GPU_TEMP_ABORT = int(os.environ.get("AUDITV_GPU_TEMP_ABORT", "92"))
-GPU_TEMP_CHECK_INTERVAL = 10.0  # segundos entre muestras del monitor
+GPU_TEMP_RESUME = int(os.environ.get("AUDITV_GPU_TEMP_RESUME", "75"))
+GPU_TEMP_CHECK_INTERVAL = float(
+    os.environ.get("AUDITV_GPU_TEMP_INTERVAL", "5.0")
+)  # segundos entre muestras del monitor
+# Segmentos (s) de audio por lote al transcribir en GPU: si la tarjeta se
+# calienta, los lotes que falten siguen en CPU sin perder lo ya transcrito.
+TRANSCRIBE_CHUNK_SEC = float(os.environ.get("AUDITV_TRANSCRIBE_CHUNK_SEC", "300"))
+# Solape entre lotes de audio, para que una palabra no se parta en el corte.
+_TRANSCRIBE_OVERLAP_SEC = 1.0
+# 4096 evita que el LLM local se desborde de la VRAM de GPUs pequeñas y evita
+# el apagado por sobrecalentamiento en portátiles. "auto" lo ajusta al equipo.
+OLLAMA_NUM_CTX = os.environ.get("OLLAMA_NUM_CTX", "auto")
 
 # Default folders inside the project for URL downloads / automated outputs.
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -77,68 +92,318 @@ def log(msg: str, level: str = "INFO") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Device detection (GPU / CPU)
+# Status file (lo lee la GUI para pintar el panel de GPU en tiempo real)
 # ---------------------------------------------------------------------------
+STATUS_FILE = os.environ.get("AUDITV_STATUS_FILE") or ""
+_status = {"data": {}, "lock": threading.Lock()}
+
+
+def status_reset(**fields) -> None:
+    """Vacía el estado (empieza una ejecución) y escribe el fichero."""
+    with _status["lock"]:
+        _status["data"] = {"running": True, "started": time.time(),
+                           "pid": os.getpid()}
+        _status["data"].update(fields)
+        _write_status()
+
+
+def status_update(**fields) -> None:
+    """Actualiza campos del estado y los escribe (no hace nada si no hay
+    AUDITV_STATUS_FILE: así el CLI funciona igual sin la GUI)."""
+    if not STATUS_FILE:
+        return
+    with _status["lock"]:
+        _status["data"].update(fields)
+        _status["data"]["updated"] = time.time()
+        _write_status()
+
+
+def status_set(running: bool = True, **fields) -> None:
+    """Marca la ejecución como terminada (la GUI deja de mostrar actividad)."""
+    with _status["lock"]:
+        _status["data"].update(fields)
+        _status["data"]["running"] = running
+        _status["data"]["updated"] = time.time()
+        _write_status()
+
+
+def _write_status() -> None:
+    """Volca el estado a disco (escritura atómica para que la GUI no lea
+    un JSON a medias)."""
+    if not STATUS_FILE:
+        return
+    try:
+        payload = dict(_status["data"])
+        payload["thresholds"] = {
+            "warn": GPU_TEMP_WARN, "abort": GPU_TEMP_ABORT,
+            "resume": GPU_TEMP_RESUME,
+        }
+        tmp = f"{STATUS_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, STATUS_FILE)
+    except Exception as exc:  # nunca romper el análisis por el panel
+        log(f"No se pudo escribir el estado ({exc})", "WARN")
+
+
+# ---------------------------------------------------------------------------
+# Device detection (GPU / CPU) y elección de modelos (agnóstica)
+# ---------------------------------------------------------------------------
+# Reexports de hardware para que la GUI y los wrappers usen el mismo sitio.
+gpu_temperature = hardware.gpu_temperature
+gpu_infos = hardware.gpu_infos
+primary_gpu = hardware.primary_gpu
+gpu_tier = hardware.gpu_tier
+list_ollama_models = hardware.ollama_models
+gpu_summary = hardware.hardware_summary
+
+
+def gpu_index_list() -> list:
+    """['auto', '0', '1', ...] con las GPUs NVIDIA detectadas."""
+    gpus = hardware.gpu_infos()
+    return ["auto"] + [str(g["index"]) for g in gpus] if gpus else ["auto"]
+
+
 def detect_device(hint: str = DEVICE_HINT) -> str:
     """Return 'cuda' if torch can actually run on the GPU, else 'cpu'.
 
     Hint: 'cpu' forces CPU (safe on laptops with weak cooling), 'cuda' forces
-    CUDA, 'auto' keeps the current auto-detection.
+    CUDA, 'auto' uses the GPU only if this PyTorch build really supports it
+    (una GTX 1060 sm_61, por ejemplo, cae siempre a CPU).
     """
     if hint == "cpu":
         log("Device forzado a CPU (AUDITV_DEVICE=cpu / --device cpu).", "DEVICE")
+        status_update(device="cpu", device_reason="forzado por el usuario")
+        return "cpu"
+
+    info = hardware.torch_cuda_info()
+    if not info.get("available"):
+        log(f"Sin GPU para PyTorch ({info.get('reason') or 'sin CUDA'}): CPU.", "DEVICE")
+        status_update(device="cpu", device_reason=info.get("reason") or "sin CUDA")
+        return "cpu"
+    if not info.get("usable"):
+        log(
+            f"GPU {info.get('name')} (sm_{str(info.get('cap')).replace('.', '')}) "
+            f"no la soporta este torch: {info.get('reason')}. Whisper irá en CPU "
+            "(el LLM de Ollama sí puede aprovechar la tarjeta).",
+            "DEVICE",
+        )
+        status_update(device="cpu", device_reason=info.get("reason"))
         return "cpu"
     try:
         import torch
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
-            cap = torch.cuda.get_device_capability(0)
-            arch = torch.cuda.get_arch_list()
-            sm = f"sm_{cap[0]}{cap[1]}" if cap else "?"
-
-            # 1) Check supported architecture list (sm_XX or compute_XX).
-            supported = any(sm in a for a in arch) or any(
-                a.startswith("compute_") for a in arch
-            )
-            if not supported:
-                log(
-                    f"GPU {name} ({sm}) not supported by torch {torch.__version__} "
-                    f"(supports {arch or '[]'}). Using CPU.",
-                    "DEVICE",
-                )
-                return "cpu"
-
-            # 2) Real functional test: run a tiny CUDA kernel.
-            x = torch.ones(1, device="cuda")
-            _ = (x + 1).item()
-            log(f"GPU detected: {name} ({sm})", "DEVICE")
-            if hint == "cuda":
-                log("Device forzado a CUDA (--device cuda).", "DEVICE")
-            return "cuda"
-        else:
-            log("No GPU detected, using CPU.", "DEVICE")
-            return "cpu"
+        x = torch.ones(1, device="cuda")
+        _ = (x + 1).item()  # prueba funcional real
     except Exception as exc:
-        log(f"CUDA unusable, falling back to CPU: {exc}", "DEVICE")
+        log(f"CUDA no utilizable ({exc}): se trabaja en CPU.", "DEVICE")
+        status_update(device="cpu", device_reason=str(exc))
         return "cpu"
+
+    log(
+        f"GPU para Whisper: {info.get('name')} "
+        f"({hardware.fmt_vram(info.get('vram_mb'))}, sm_{str(info.get('cap')).replace('.', '')})",
+        "DEVICE",
+    )
+    status_update(device="cuda", device_reason=info.get("name"))
+    return "cuda"
+
+
+def resolve_whisper_model(requested: str = None, device: str = "cpu",
+                          duration_s: float = None) -> str:
+    """Convierte 'auto' (o vacío) en un modelo de Whisper concreto.
+
+    No toca nada si ya viene un nombre explícito: así `--model small` sigue
+    mandando sobre la recomendación.
+    """
+    requested = (requested or DEFAULT_WHISPER_MODEL or "auto").strip()
+    if requested.lower() not in ("auto", ""):
+        return requested
+    vram = None
+    if str(device).startswith("cuda"):
+        vram = hardware.torch_cuda_info().get("vram_mb") or None
+    model = hardware.recommend_whisper_model(device, vram, duration_s)
+    cached = hardware.whisper_cached_models()
+    extra = f" Ya en caché: {', '.join(cached)}." if cached else ""
+    log(
+        f"Modelo Whisper 'auto' -> {model} "
+        f"({'GPU' if str(device).startswith('cuda') else 'CPU'}, "
+        f"{int((duration_s or 0) // 60)} min de audio).{extra}",
+        "DEVICE",
+    )
+    status_update(whisper_model=model, whisper_model_auto=True)
+    return model
+
+
+def resolve_ollama_model(requested: str = None, use_gpu: bool = None) -> str:
+    """Convierte 'auto' en el mejor modelo que haya instalado en Ollama.
+
+    Así cada usuario acaba usando lo que tiene descargado, sin tener que
+    acordarse de la etiqueta. Si Ollama no responde se avisa y se devuelve el
+    nombre pedido (para que el error de Ollama sea explícito).
+    """
+    requested = (requested or DEFAULT_OLLAMA_MODEL or "auto").strip()
+    if requested.lower() not in ("auto", ""):
+        return requested
+    models = hardware.ollama_models()
+    if not models:
+        log(
+            "No se pudo leer la lista de modelos de Ollama "
+            f"({OLLAMA_URL}). Arranca 'ollama serve' o fija el modelo con "
+            "--llm <nombre> / OLLAMA_MODEL.",
+            "WARN",
+        )
+        status_update(llm_model=None, llm_model_auto=False)
+        return requested
+    best, info = hardware.pick_ollama_model(models, use_gpu=use_gpu)
+    names = ", ".join(m["name"] for m in models)
+    log(
+        f"Modelos en Ollama: {names} -> usando '{best}' "
+        f"({hardware.model_size_gb(info):.1f} GB, "
+        f"{'con GPU' if hardware.ollama_budget_gb(use_gpu) > hardware.CPU_BUDGET_GB else 'en CPU'}).",
+        "LLM",
+    )
+    status_update(llm_model=best, llm_model_auto=True,
+                  llm_models=[m["name"] for m in models])
+    return best
+
+
+def resolve_num_ctx(device_for_llm: str = "cpu") -> int:
+    """Contexto de Ollama: 'auto' lo ajusta a la VRAM disponible."""
+    raw = str(OLLAMA_NUM_CTX).strip().lower()
+    if raw not in ("auto", ""):
+        try:
+            return int(float(raw))
+        except ValueError:
+            pass
+    if str(device_for_llm) == "gpu":
+        gpu = primary_gpu()
+        vram = gpu.get("vram_total_mb") or 0
+        return 8192 if vram >= 10240 else 4096
+    return 4096
+
+
+def ollama_use_gpu_default() -> bool:
+    """¿Manda Ollama a la GPU? (OLLAMA_NUM_GPU=auto -> según la potencia)."""
+    raw = str(OLLAMA_NUM_GPU).strip().lower()
+    if raw in ("auto", ""):
+        return hardware.ollama_gpu_default()[0]
+    try:
+        return int(float(raw)) != 0
+    except ValueError:
+        return hardware.ollama_gpu_default()[0]
+
+
+def transcript_checkpoint_path(output_md: str) -> str:
+    """Ruta del .txt de transcripción que acompaña al informe."""
+    base = Path(output_md)
+    return str(base.with_name(base.stem + "_transcripcion.txt"))
+
+
+def _log_environment(device: str) -> None:
+    """Log de arranque: qué equipo ha encontrado y cómo va a usarlo."""
+    for line in hardware.log_lines():
+        log(line, "DEVICE")
+    gpu = primary_gpu()
+    if gpu:
+        use_gpu, reason = hardware.ollama_gpu_default()
+        log(f"IA local: {reason}.", "LLM")
+        log(
+            f"Temperatura GPU: aviso {GPU_TEMP_WARN}°C, descanso {GPU_TEMP_ABORT}°C, "
+            f"se retoma a {GPU_TEMP_RESUME}°C (medición cada {GPU_TEMP_CHECK_INTERVAL:g} s).",
+            "GPU",
+        )
+    status_update(gpu_info=hardware.hardware_summary())
 
 
 # ---------------------------------------------------------------------------
 # GPU health monitoring (avoids thermal shutdowns on laptops / weak GPUs)
 # ---------------------------------------------------------------------------
-def gpu_temperature() -> float:
-    """Return current GPU temperature in °C from nvidia-smi, or None if NA."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode != 0:
-            return None
-        line = out.stdout.strip().splitlines()
-        return float(line[0]) if line else None
-    except Exception:
-        return None
+class GpuThermalGuard:
+    """Decide si la GPU puede trabajar o si debe descansar.
+
+    La GPU entra en 'reposo' al superar GPU_TEMP_ABORT y no vuelve al trabajo
+    hasta bajar de GPU_TEMP_RESUME (histéresis: evita subir y bajar cada bache).
+    Mientras descansa, cada bache se resuelve en CPU **sin perder su
+    resultado**, y en cuanto la tarjeta se enfría el trabajo vuelve a la GPU.
+    """
+
+    def __init__(self):
+        self.resting = False
+        self.last_temp = None
+        self.reason = ""
+        self._lock = threading.Lock()
+
+    # -- estado -------------------------------------------------------------
+    def has_gpu(self) -> bool:
+        return bool(hardware.gpu_infos())
+
+    def temp(self) -> float:
+        temp = hardware.gpu_temperature()
+        if temp is not None:
+            self.last_temp = temp
+        return temp
+
+    def mark_rest(self, reason: str) -> None:
+        with self._lock:
+            if not self.resting:
+                log(
+                    f"GPU en descanso: {reason}. Los lotes siguientes van en CPU "
+                    f"hasta que baje de {GPU_TEMP_RESUME}°C (para que el equipo no "
+                    "se apague). No se pierde nada: cada lote se guarda igualmente.",
+                    "WARN",
+                )
+            self.resting = True
+            self.reason = reason
+        status_update(gpu_resting=True, gpu_rest_reason=reason)
+        # Que la tarjeta se enfríe de verdad: Ollama suelta el modelo de la GPU.
+        threading.Thread(target=unload_ollama_model, daemon=True).start()
+
+    def clear_rest(self) -> None:
+        with self._lock:
+            if self.resting:
+                log(
+                    f"GPU ya está a {self.last_temp:.0f}°C (≤ {GPU_TEMP_RESUME}°C): "
+                    "vuelve a trabajar en la GPU.",
+                    "INFO",
+                )
+            self.resting = False
+            self.reason = ""
+        status_update(gpu_resting=False, gpu_rest_reason="")
+
+    def should_use_gpu(self, what: str = "") -> bool:
+        """¿Toca usar la GPU ahora mismo? (respeta el descanso en curso)"""
+        if not self.has_gpu():
+            return False
+        temp = self.temp()
+        if temp is None:
+            return not self.resting
+        if self.resting:
+            if temp <= GPU_TEMP_RESUME:
+                self.clear_rest()
+            else:
+                return False
+        if temp >= GPU_TEMP_ABORT:
+            self.mark_rest(
+                f"{temp:.0f}°C (límite {GPU_TEMP_ABORT}°C)"
+                + (f" antes de '{what}'" if what else "")
+            )
+            return False
+        return True
+
+    def snapshot(self) -> dict:
+        return {
+            "resting": self.resting,
+            "reason": self.reason,
+            "temp_c": self.temp(),
+            "warn": GPU_TEMP_WARN,
+            "abort": GPU_TEMP_ABORT,
+            "resume": GPU_TEMP_RESUME,
+        }
+
+
+_thermal = {"event": threading.Event()}
+_open_resp = {"resp": None}
+GUARD = GpuThermalGuard()
 
 
 def check_gpu_health(stage: str) -> None:
@@ -151,63 +416,70 @@ def check_gpu_health(stage: str) -> None:
             f"GPU a {temp:.0f}°C antes de '{stage}' (límite {GPU_TEMP_ABORT}°C). "
             "Aborto preventivo para proteger el hardware. Deja enfriar el equipo "
             "y vuelve a ejecutar con: --autoclean keep --device cpu "
-            "OLLAMA_NUM_GPU=0 OLLAMA_NUM_CTX=2048"
+            "--ollama-gpu cpu OLLAMA_NUM_CTX=2048"
         )
     if temp >= GPU_TEMP_WARN:
         log(
             f"GPU ya está a {temp:.0f}°C antes de '{stage}': riesgo alto de "
             "apagado por temperatura. Reintenta con --device cpu y/o "
-            "OLLAMA_NUM_GPU=0 para no exigir a la tarjeta.",
+            "--ollama-gpu cpu para no exigir a la tarjeta.",
             "WARN",
         )
 
 
 class _GpuMonitor(threading.Thread):
-    """Background thread that logs warnings if the GPU gets too hot.
+    """Hilo que vigila la temperatura cada GPU_TEMP_CHECK_INTERVAL segundos.
 
-    On critical temperature it does NOT kill the process: it sets an event and
-    cancels any in-flight Ollama request so the pipeline can continue and the
-    report is still written (with the analysis that was possible).
+    Avisa mientras sube, y al llegar al límite crítico no mata el proceso: pone
+    la GPU en descanso y cancela la consulta en vuelo de Ollama, que se
+    reintenta en CPU para que ese lote no se pierda. El informe se escribe
+    igualmente con lo que se haya podido analizar.
     """
 
     def __init__(self, stage: str):
         super().__init__(daemon=True)
         self._stage = stage
         self._stop = threading.Event()
+        self._warned = False
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
-        global _open_resp
         while not self._stop.wait(GPU_TEMP_CHECK_INTERVAL):
-            temp = gpu_temperature()
+            temp = hardware.gpu_temperature(max_age=0)
             if temp is None:
                 continue
+            status_update(gpu_temp=temp)
             if temp >= GPU_TEMP_ABORT:
                 log(
                     f"GPU a {temp:.0f}°C durante '{self._stage}': temperatura "
-                    f"crítica ({GPU_TEMP_ABORT}°C). Cancelando el análisis LLM "
-                    "para proteger el hardware (el informe se generará igualmente).",
+                    f"crítica ({GPU_TEMP_ABORT}°C). La GPU pasa a descansar y el "
+                    "análisis LLM se termina en CPU (el informe se genera igual).",
                     "ERROR",
                 )
+                GUARD.mark_rest(f"{temp:.0f}°C durante '{self._stage}'")
                 _thermal["event"].set()
                 _cancel_open_request()
             elif temp >= GPU_TEMP_WARN:
+                if not self._warned:
+                    self._warned = True
                 log(
                     f"GPU a {temp:.0f}°C durante '{self._stage}' "
-                    f"(límite de aviso {GPU_TEMP_WARN}°C). Si sigue subiendo, "
-                    "usa OLLAMA_NUM_GPU=0 / --device cpu.",
+                    f"(aviso {GPU_TEMP_WARN}°C, descanso {GPU_TEMP_ABORT}°C).",
                     "WARN",
+                )
+            else:
+                self._warned = False
+                log(
+                    f"GPU a {temp:.0f}°C durante '{self._stage}' "
+                    f"(límite {GPU_TEMP_ABORT}°C).",
+                    "GPU",
                 )
 
 
 class ThermalAbort(RuntimeError):
     """Raised when the GPU reaches the critical temperature."""
-
-
-_thermal = {"event": threading.Event()}
-_open_resp = {"resp": None}
 
 
 def _cancel_open_request() -> None:
@@ -218,6 +490,48 @@ def _cancel_open_request() -> None:
             resp.close()
         except Exception:
             pass
+
+
+# Modelo que se está usando ahora mismo (para poder soltarlo de la GPU).
+_ollama_state = {"model": None}
+
+
+def unload_ollama_model(model: str = None) -> None:
+    """Pide a Ollama que suelte el modelo de la VRAM (keep_alive=0).
+
+    Así la GPU se enfría de verdad mientras el análisis sigue en CPU. Si Ollama
+    no está o falla, no pasa nada: es una optimización, no un requisito.
+    """
+    model = model or _ollama_state.get("model")
+    if not model:
+        return
+    try:
+        payload = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        log(f"Ollama suelta '{model}' de la GPU (keep_alive=0) para enfriarla.", "GPU")
+        status_update(gpu_unloaded_model=model)
+    except Exception as exc:
+        log(f"No se pudo descargar el modelo de la GPU: {exc}", "WARN")
+
+
+def media_duration(path: str) -> float:
+    """Duración en segundos del medio (0 si ffprobe no responde)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return float(out.stdout.strip().splitlines()[0])
+    except Exception:
+        pass
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +572,74 @@ def has_video_stream(path: str) -> bool:
 # ---------------------------------------------------------------------------
 # Transcription with Whisper
 # ---------------------------------------------------------------------------
-def transcribe_audio(audio_path: str, model_size: str, device: str) -> dict:
+def _segments_of(result: dict, offset: float = 0.0) -> list:
+    """Segmentos de un resultado de Whisper con los tiempos desplazados."""
+    out = []
+    for seg in result.get("segments") or []:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({
+            "start": round(float(seg.get("start", 0.0)) + offset, 2),
+            "end": round(float(seg.get("end", 0.0)) + offset, 2),
+            "text": text,
+        })
+    return out
+
+
+def _whisper_call(model, device: str, source, language: str = None) -> dict:
+    """Una llamada a Whisper con silenciados los warnings genéricos de torch."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Performing inference on CPU when CUDA is available",
+        )
+        kwargs = {"fp16": device == "cuda", "condition_on_previous_text": False}
+        if language:
+            kwargs["language"] = language
+        return model.transcribe(source, **kwargs)
+
+
+def _probe_wav_duration(audio_path: str) -> float:
+    with contextlib.closing(wave.open(audio_path, "rb")) as wav:
+        return wav.getnframes() / float(wav.getframerate() or 1)
+
+
+def _read_wav_chunks(audio_path: str, chunk_sec: float, overlap_sec: float):
+    """Parte un WAV 16 kHz mono en trozos de `chunk_sec` segundos.
+
+    Los trozos se solapan `overlap_sec` para que el modelo tenga contexto del
+    corte (una palabra partida no se pierde); el solape se descarta después.
+    """
+    import numpy as np
+
+    with contextlib.closing(wave.open(audio_path, "rb")) as wav:
+        rate = wav.getframerate()
+        samples = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+
+    step = max(1, int(rate * chunk_sec))
+    overlap = max(0, int(rate * overlap_sec))
+    pos = 0
+    while pos < samples.size:
+        end = min(samples.size, pos + step)
+        audio = samples[pos:end].astype("float32") / 32768.0
+        if audio.size:
+            yield pos / rate, audio
+        if end >= samples.size:
+            break
+        pos = max(pos + 1, end - overlap)
+
+
+def transcribe_audio(audio_path: str, model_size: str, device: str,
+                     checkpoint_path: str = None) -> dict:
     """Transcribe audio with Whisper, return dict with 'text' and 'segments'.
 
     segments: list of {"start": seconds, "end": seconds, "text": str}
+
+    En GPU se transcribe por lotes (TRANSCRIBE_CHUNK_SEC): antes de cada lote
+    se mira la temperatura, así que si la tarjeta se calienta los lotes que
+    falten se hacen en CPU **sin perder lo ya transcrito** (además se guarda el
+    checkpoint tras cada lote). En cuando la GPU se enfría, se vuelve a ella.
     """
     global whisper
     if whisper is None:
@@ -282,41 +660,154 @@ def transcribe_audio(audio_path: str, model_size: str, device: str) -> dict:
             "when CUDA is available' de Whisper es genérico y se ignora.",
             "DEVICE",
         )
-    else:
-        log("Transcribing...")
+    status_update(whisper_device=device, whisper_model=model_size)
+
+    if device != "cpu" and TRANSCRIBE_CHUNK_SEC > 0:
+        try:
+            duration = _probe_wav_duration(audio_path)
+        except Exception as exc:
+            log(f"No se pudo calcular la duración del audio: {exc}", "WARN")
+            duration = 0.0
+        if duration > TRANSCRIBE_CHUNK_SEC:
+            return _transcribe_chunked(model, audio_path, device, duration,
+                                       checkpoint_path)
+    return _transcribe_single(model, audio_path, device)
+
+
+def _transcribe_single(model, audio_path: str, device: str) -> dict:
+    """Pasada única: todo el audio de una vez (CPU o audio corto)."""
     monitor = None
-    if device == "cuda":
+    if device != "cpu":
         check_gpu_health("transcripción")
         monitor = _GpuMonitor("transcripción")
         monitor.start()
     try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Performing inference on CPU when CUDA is available",
-            )
-            result = model.transcribe(audio_path, fp16=(device == "cuda"))
+        log("Transcribiendo…", "AUDITV")
+        result = _whisper_call(model, device, audio_path)
     finally:
         if monitor is not None:
             monitor.stop()
             monitor.join(timeout=GPU_TEMP_CHECK_INTERVAL + 1)
 
-    segments = []
-    for seg in result.get("segments", []):
-        segments.append({
-            "start": float(seg["start"]),
-            "end": float(seg["end"]),
-            "text": str(seg["text"]).strip(),
-        })
+    segments = _segments_of(result)
+    text = str(result.get("text") or "").strip()
+    log(f"Transcripción completa: {len(segments)} segmentos.")
+    status_update(whisper_segments=len(segments))
+    return {"text": text, "segments": segments}
 
-    log(f"Transcription complete. {len(segments)} segments.")
-    return {"text": result.get("text", "").strip(), "segments": segments}
+
+def _transcribe_chunked(model, audio_path: str, device: str, duration: float,
+                        checkpoint_path: str = None) -> dict:
+    """Transcribe por lotes de TRANSCRIBE_CHUNK_SEC, saltando GPU<->CPU si toca.
+
+    El lote se considera entregado cuando termina (se guarda su checkpoint),
+    así que un cambio de dispositivo a mitad no cuesta nada: nunca se pierde un
+    lote por el camino.
+    """
+    n_batches = int(duration // TRANSCRIBE_CHUNK_SEC) + 1
+    log(
+        f"Audio de {int(duration // 60)} min: transcripción en {n_batches} lotes "
+        f"de ~{int(TRANSCRIBE_CHUNK_SEC // 60)} min para poder descansar la GPU.",
+        "AUDITV",
+    )
+    segments = []
+    language = None
+    current = device
+    monitor = _GpuMonitor("transcripción")
+    monitor.start()
+    t_start = time.time()
+    try:
+        batches = _read_wav_chunks(audio_path, TRANSCRIBE_CHUNK_SEC,
+                                   _TRANSCRIBE_OVERLAP_SEC)
+        for i, (offset, audio) in enumerate(batches, 1):
+            # Antes de cada lote se decide dónde se hace: la GPU entra en
+            # descanso cuando se calienta y vuelve cuando se enfría.
+            want = device
+            if device != "cpu" and not GUARD.should_use_gpu("transcripción"):
+                want = "cpu"
+            if want != current:
+                _move_whisper(model, want)
+                if want == "cpu":
+                    log(
+                        f"Lote {i}/{n_batches}: la GPU está caliente, este lote va "
+                        "en CPU. Lo ya transcrito no se pierde.",
+                        "WARN",
+                    )
+                else:
+                    log(
+                        f"Lote {i}/{n_batches}: la GPU ya está fría, se retoma en GPU.",
+                        "DEVICE",
+                    )
+                current = want
+
+            result = _whisper_call(model, current, audio, language=language)
+            if i == 1 and result.get("language"):
+                language = result["language"]
+                log(f"Idioma detectado: {language}.", "DEVICE")
+
+            # La cola del lote anterior se repite en este (es el solape): se
+            # descarta la vieja transcripción y se queda con la más reciente.
+            if segments and offset > 0:
+                segments[:] = [s for s in segments if s["start"] < offset]
+
+            new_segs = _segments_of(result, offset)
+            segments.extend(new_segs)
+            status_update(
+                stage="transcripción",
+                whisper_batch=f"{i}/{n_batches}",
+                whisper_batch_device="GPU" if current == "cuda" else "CPU",
+                whisper_segments=len(segments),
+            )
+            log(
+                f"Lote {i}/{n_batches} desde {fmt_ts(offset)} en "
+                f"{'GPU' if current == 'cuda' else 'CPU'}: {len(new_segs)} "
+                f"segmentos ({len(segments)} en total).",
+                "AUDITV",
+            )
+            if checkpoint_path:
+                _checkpoint_transcript(segments, checkpoint_path)
+    finally:
+        monitor.stop()
+        monitor.join(timeout=GPU_TEMP_CHECK_INTERVAL + 1)
+
+    log(
+        f"Transcripción completa: {len(segments)} segmentos en "
+        f"{int(time.time() - t_start)} s.",
+    )
+    status_update(whisper_segments=len(segments), whisper_batch=None,
+                  whisper_batch_device=None)
+    return {"text": _transcript_text(segments), "segments": segments}
+
+
+def _move_whisper(model, device: str) -> None:
+    """Mueve el modelo de Whisper entre GPU y CPU sin recargarlo."""
+    try:
+        model.to(device)
+    except Exception as exc:
+        log(f"No se pudo mover Whisper a {device}: {exc}", "WARN")
+
+
+def _transcript_text(segments: list) -> str:
+    """Texto corrido a partir de los segmentos (única fuente de verdad)."""
+    return " ".join(s["text"] for s in segments if s.get("text")).strip()
+
+
+def _checkpoint_transcript(segments: list, path: str) -> None:
+    """Guarda lo transcrito hasta ahora (nada se pierde si algo falla)."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_transcript_text(segments) + "\n")
+    except Exception as exc:
+        log(f"No se pudo guardar el checkpoint de la transcripción: {exc}", "WARN")
+
 
 
 # ---------------------------------------------------------------------------
 # Frame extraction
 # ---------------------------------------------------------------------------
-def extract_frames(video_path: str, output_dir: str, interval_sec: float) -> list:
+def extract_video_frames(video_path: str, output_dir: str,
+                         interval_sec: float) -> list:
     """Extract frames every interval_sec. Returns list of {path, timestamp}."""
     os.makedirs(output_dir, exist_ok=True)
     cmd = [
@@ -339,33 +830,40 @@ def extract_frames(video_path: str, output_dir: str, interval_sec: float) -> lis
 # ---------------------------------------------------------------------------
 # Ollama integration (summary + ideas extraction)
 # ---------------------------------------------------------------------------
+def _num_gpu_layers() -> int:
+    """Capas del LLM que se mandan a la GPU (OLLAMA_NUM_GPU: auto/1/-1/0)."""
+    raw = str(OLLAMA_NUM_GPU).strip().lower()
+    if raw in ("auto", ""):
+        return -1  # tantas capas como quepan: decide Ollama
+    try:
+        return int(float(raw))
+    except ValueError:
+        return -1
+
+
 def _ollama_generate(prompt: str, model: str, system: str = "", label: str = "") -> str:
     """Send a prompt to a local Ollama server and return the raw text output.
 
-    Usa la GPU (OLLAMA_NUM_GPU != 0) salvo que la temperatura la desaconseje:
-    si la GPU ya está crítica o se calienta durante la consulta, ESA misma
-    consulta se reintenta en CPU (num_gpu=0) para que ningún bache se pierda
-    y el equipo no se apague. Los baches siguientes siguen en CPU mientras
-    la tarjeta no se enfríe.
+    Cada bache se hace en GPU salvo que la temperatura la desaconseje
+    (OLLAMA_NUM_GPU=auto decide además según lo potente que sea la tarjeta):
+
+    * si la GPU está en descanso por calor, el bache va a CPU y **no se pierde**;
+    * si se calienta durante la consulta, ESA misma consulta se reintenta en CPU
+      (tampoco se pierde el bache) y la GPU queda libre para enfriarse;
+    * en cuanto la tarjeta baja de GPU_TEMP_RESUME, los siguientes baches
+      vuelven a la GPU solos.
     """
-    use_gpu = int(OLLAMA_NUM_GPU) != 0
-    if use_gpu:
-        temp = gpu_temperature()
-        if temp is not None and temp >= GPU_TEMP_ABORT:
-            log(
-                f"GPU a {temp:.0f}°C (límite {GPU_TEMP_ABORT}°C): la GPU está "
-                "muy caliente; esta consulta se ejecuta en CPU para no perder "
-                "el bache ni apagar el equipo.",
-                "WARN",
-            )
-            use_gpu = False
-        elif temp is not None and temp >= GPU_TEMP_WARN:
-            log(
-                f"GPU a {temp:.0f}°C antes de '{label or 'análisis'}': riesgo alto "
-                "de apagado. Si la temperatura sigue subiendo, se continúa en "
-                "CPU sin perder esta parte.",
-                "WARN",
-            )
+    gpu_wanted = ollama_use_gpu_default()
+    use_gpu = gpu_wanted and GUARD.should_use_gpu(label or "análisis")
+    if gpu_wanted and not use_gpu:
+        log(
+            f"'{label or 'análisis'}' se resuelve en CPU: la GPU descansa "
+            f"({GUARD.reason or 'temperatura alta'}). El resultado del bache se "
+            "guarda igualmente.",
+            "WARN",
+        )
+    _ollama_state["model"] = model
+    status_update(llm_device="GPU" if use_gpu else "CPU", llm_gpu_wanted=gpu_wanted)
     try:
         return _ollama_generate_once(prompt, model, system, label, use_gpu)
     except ThermalAbort:
@@ -378,6 +876,7 @@ def _ollama_generate(prompt: str, model: str, system: str = "", label: str = "")
             "conclusiones de esta parte (la GPU queda libre para enfriarse).",
             "WARN",
         )
+        status_update(llm_device="CPU")
         return _ollama_generate_once(prompt, model, system, label, use_gpu=False)
 
 
@@ -389,8 +888,8 @@ def _ollama_generate_once(
         raise ThermalAbort(GPU_TEMP_ABORT)
 
     options = {
-        "num_ctx": OLLAMA_NUM_CTX,
-        "num_gpu": int(OLLAMA_NUM_GPU) if use_gpu else 0,
+        "num_ctx": resolve_num_ctx("gpu" if use_gpu else "cpu"),
+        "num_gpu": _num_gpu_layers() if use_gpu else 0,
     }
     if OLLAMA_GPU_INDEX not in (None, "", "auto"):
         try:
@@ -423,7 +922,10 @@ def _ollama_generate_once(
         )
         _open_resp["resp"] = None
         stop_beat = threading.Event()
-        gpu_mode = "CPU" if not use_gpu else f"GPU{'' if OLLAMA_GPU_INDEX is None else ' ' + OLLAMA_GPU_INDEX}"
+        gpu_mode = "CPU" if not use_gpu else (
+            f"GPU {OLLAMA_GPU_INDEX}"
+            if OLLAMA_GPU_INDEX not in (None, "", "auto") else "GPU"
+        )
         log(f"LLM [{model}] {label or 'análisis'}: enviando consulta… ({gpu_mode})", "INFO")
 
         def _heartbeat() -> None:
@@ -438,6 +940,8 @@ def _ollama_generate_once(
                     f"Esperando su respuesta…",
                     "INFO",
                 )
+                # Refresca el panel de la GUI (con la temperatura incluida).
+                status_update(gpu_temp=GUARD.temp(), stage=label or "análisis LLM")
 
         heartbeat = threading.Thread(target=_heartbeat, daemon=True)
         heartbeat.start()
@@ -453,6 +957,15 @@ def _ollama_generate_once(
             log("Análisis LLM cancelado por temperatura crítica.", "ERROR")
             raise
         except Exception as exc:
+            if _thermal["event"].is_set() and use_gpu:
+                # El monitor cerró la consulta porque se calentó la GPU: no es
+                # un fallo del LLM, es calor. Se relanza como ThermalAbort para
+                # que este bache se reintente en CPU y no se pierda.
+                log(
+                    f"La consulta se interrumpió al calentarse la GPU: {exc}",
+                    "WARN",
+                )
+                raise ThermalAbort(GPU_TEMP_ABORT) from exc
             log(f"LLM [{model}] {label or 'análisis'}: falló la consulta: {exc}", "ERROR")
             raise
         finally:
@@ -736,10 +1249,12 @@ def analyze_transcript_in_parts(
     if not text.strip():
         return {"resumen": "*(Sin transcripción disponible)*", "ideas": [], "discusiones": [], "conceptos": [], "conclusiones": []}
 
+    model = resolve_ollama_model(model)
     parts = split_text(text, part_chars)
     if not parts:
         parts = [text]
     if len(parts) == 1:
+        status_update(stage="análisis LLM", batch="1/1")
         analysis = analyze_with_ollama(text, model, include_timestamps)
         if with_details:
             return analysis, parts, [analysis]
@@ -751,6 +1266,8 @@ def analyze_transcript_in_parts(
     n_total = len(parts)
     for i, part in enumerate(parts, 1):
         part_analysis = {"resumen": "*(Sin contenido en esta parte)*"}
+        status_update(batch=f"{i}/{n_total}", stage="análisis LLM",
+                      batch_chars=len(part or ""))
         if not use_llm:
             part_analysis = {
                 "resumen": "*(Análisis LLM omitido)*",
@@ -777,6 +1294,7 @@ def analyze_transcript_in_parts(
             _save_part_files(part, part_analysis, out_md, video_path, i, n_total, model)
 
     merged = merge_analyses(analyses, model)
+    status_update(batch=None)
     if with_details:
         return merged, parts, analyses
     return merged
@@ -855,6 +1373,17 @@ def build_frames_section(frames: list, frames_dir: str, output_md: str = None) -
 # ---------------------------------------------------------------------------
 # Markdown generation
 # ---------------------------------------------------------------------------
+def _engine_note() -> str:
+    """Una línea con el equipo usado (GPU y si está en descanso por calor)."""
+    gpu = primary_gpu()
+    if not gpu:
+        return "sin GPU NVIDIA (todo en CPU)"
+    note = f"{gpu['name']} · {hardware.fmt_vram(gpu.get('vram_total_mb'))} · nivel {hardware.TIER_LABEL.get(hardware.gpu_tier(gpu), '?')}"
+    if GUARD.resting:
+        note += " · en descanso por temperatura"
+    return note
+
+
 def build_markdown(
     video_path: str,
     transcript: dict,
@@ -865,6 +1394,7 @@ def build_markdown(
     ollama_model: str,
     frames_dir: str,
     output_md: str,
+    llm_device: str = None,
 ) -> None:
     """Generate the final structured Markdown report."""
     video_name = Path(video_path).name
@@ -874,8 +1404,13 @@ def build_markdown(
     lines.append(f"# 🎬 Análisis: {video_name}")
     lines.append("")
     lines.append(f"- **Generado:** {now}")
-    lines.append(f"- **Modelo Whisper:** {whisper_model} ({device})")
-    lines.append(f"- **Modelo LLM:** {ollama_model}")
+    lines.append(
+        f"- **Modelo Whisper:** {whisper_model} "
+        f"({'GPU' if str(device).startswith('cuda') else 'CPU'})"
+    )
+    llm_dev = f" ({llm_device})" if llm_device else ""
+    lines.append(f"- **Modelo LLM:** {ollama_model}{llm_dev}")
+    lines.append(f"- **Motor:** {_engine_note()}")
     lines.append("")
 
     if analysis.get("titulo"):
@@ -1054,13 +1589,12 @@ def save_transcript_checkpoint(transcript: dict, output_md: str) -> str:
 
     If the machine shuts down mid-run, the transcription is already on disk.
     """
-    base = Path(output_md)
-    txt_path = base.with_name(base.stem + "_transcripcion.txt")
+    txt_path = transcript_checkpoint_path(output_md)
     text = _format_running_text(transcript.get("text", "") or "")
     with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     log(f"Checkpoint transcripción -> {txt_path}")
-    return str(txt_path)
+    return txt_path
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1717,9 @@ def transcript_to_md(
     parts = split_text(text, split_chars) if split_chars > 0 else [text]
     t_total = time.time()
     log(f"INICIO de apuntes desde: {transcript_path}", "AUDITV")
+    _log_environment("cpu")
+    status_reset(stage="preparando apuntes", output_md=output_md,
+                 device="cpu", kind="apuntes")
     if len(parts) == 1:
         _out = _transcript_part_to_md(
             transcript_path, text, ollama_model, use_llm, output_md
@@ -1192,6 +1729,7 @@ def transcript_to_md(
             f"Informe -> {_out}",
             "AUDITV",
         )
+        status_set(running=False, stage="terminado")
         return _out
 
     log(f"Texto dividido en {len(parts)} partes de ~{split_chars} caracteres.")
@@ -1234,6 +1772,7 @@ def transcript_to_md(
         f"Informe -> {combined_md}",
         "AUDITV",
     )
+    status_set(running=False, stage="terminado")
     return "\n".join(outputs)
 
 
@@ -1604,10 +2143,12 @@ def video_to_md(
         os.makedirs(frames_dir, exist_ok=True)
 
     device = detect_device(device_hint)
+    _log_environment(device)
     log(f"INICIO del análisis de: {video_path}", "AUDITV")
     log(f"Informe final -> {output_md}", "AUDITV")
     if frames_dir:
         log(f"Director de frames -> {frames_dir}", "AUDITV")
+    status_reset(stage="preparando", output_md=output_md, device=device)
 
     with tempfile.TemporaryDirectory(prefix="video_to_md_") as tmpdir:
         # 1. Extract audio
@@ -1615,12 +2156,24 @@ def video_to_md(
         log("Paso 1/5: extrayendo audio (ffmpeg)...", "AUDITV")
         _t = time.time()
         extract_audio(video_path, audio_path)
-        log(f"Paso 1/5 completado ({int(time.time() - _t)} s).", "AUDITV")
+        duration = media_duration(audio_path) or media_duration(video_path)
+        log(
+            f"Paso 1/5 completado ({int(time.time() - _t)} s, "
+            f"{int(duration // 60)} min de audio).",
+            "AUDITV",
+        )
+        status_update(stage="extrayendo audio", duration_s=duration)
+
+        # 2. Modelo de Whisper: 'auto' elige el adecuado a este equipo y duración
+        whisper_model = resolve_whisper_model(whisper_model, device, duration)
 
         # 2. Transcribe (+ checkpoint del texto por si el equipo se apaga)
         log(f"Paso 2/5: transcribiendo audio con Whisper ({whisper_model}/{device})...", "AUDITV")
         _t = time.time()
-        transcript = transcribe_audio(audio_path, whisper_model, device)
+        transcript = transcribe_audio(
+            audio_path, whisper_model, device,
+            checkpoint_path=transcript_checkpoint_path(output_md),
+        )
         save_transcript_checkpoint(transcript, output_md)
         log(
             f"Paso 2/5 completado ({int(time.time() - _t)} s): "
@@ -1633,8 +2186,12 @@ def video_to_md(
         if not skip_frames:
             log(f"Paso 3/5: extrayendo frames (cada {frame_interval}s)...", "AUDITV")
             _t = time.time()
-            frames = extract_frames(video_path, frames_dir, frame_interval)
+            frames = extract_video_frames(video_path, frames_dir, frame_interval)
             log(f"Paso 3/5 completado ({int(time.time() - _t)} s, {len(frames)} frames).", "AUDITV")
+        status_update(stage="frames", frames=len(frames))
+
+        # Modelo de Ollama: 'auto' elige el mejor de los que hay instalados.
+        ollama_model = resolve_ollama_model(ollama_model)
 
         # 4. Informe parcial (transcripción + frames) para no perder progreso
         #    si el análisis LLM no termina (corte de luz, apagado, etc.).
@@ -1686,6 +2243,7 @@ def video_to_md(
         ollama_model=ollama_model,
         frames_dir=frames_dir,
         output_md=output_md,
+        llm_device="GPU" if ollama_use_gpu_default() and not GUARD.resting else "CPU",
     )
 
     # 7. Ask whether to keep or delete the downloaded/generated files.
@@ -1701,6 +2259,7 @@ def video_to_md(
         f"Informe -> {output_md}",
         "AUDITV",
     )
+    status_set(running=False, stage="terminado", output=output_md)
     return output_md
 
 
@@ -1708,6 +2267,8 @@ def video_to_md(
 # CLI entry point
 # ---------------------------------------------------------------------------
 def main(argv=None) -> int:
+    global OLLAMA_NUM_GPU, OLLAMA_GPU_INDEX
+    global GPU_TEMP_WARN, GPU_TEMP_ABORT, GPU_TEMP_RESUME
     parser = argparse.ArgumentParser(
         description="Analyze a video: transcribe, extract ideas (via Ollama) "
         "and capture frames, outputting a structured Markdown report."
@@ -1726,13 +2287,36 @@ def main(argv=None) -> int:
     parser.add_argument("--frames-dir", default=None,
                         help="Explicit frames dir (default: <output-dir>/frames_<video>)")
     parser.add_argument("--model", "-m", default=DEFAULT_WHISPER_MODEL,
-                        help=f"Whisper model size (default: {DEFAULT_WHISPER_MODEL})")
+                        help="Whisper: auto (default) elige el modelo adecuado a "
+                             "tu GPU/CPU y a la duración del audio; o el tamaño "
+                             f"exacto (tiny/base/small/medium/large/large-v3/"
+                             f"large-v3-turbo). Default: {DEFAULT_WHISPER_MODEL}")
     parser.add_argument("--interval", "-i", type=float, default=DEFAULT_FRAME_INTERVAL,
                         help=f"Frame interval seconds (default: {DEFAULT_FRAME_INTERVAL})")
     parser.add_argument("--no-frames", action="store_true",
                         help="No extraer frames (solo transcripción + análisis)")
     parser.add_argument("--llm", default=DEFAULT_OLLAMA_MODEL,
-                         help=f"Ollama model (default: {DEFAULT_OLLAMA_MODEL})")
+                        help="Modelo de Ollama: auto (default) usa el mejor de "
+                             "los que tengas instalado; o el nombre exacto "
+                             f"(qwen3:8b, gemma3:4b, …). Default: {DEFAULT_OLLAMA_MODEL}")
+    parser.add_argument("--ollama-gpu", choices=("auto", "gpu", "cpu"),
+                        default=OLLAMA_NUM_GPU if OLLAMA_NUM_GPU in ("auto",) else
+                        ("gpu" if ollama_use_gpu_default() else "cpu"),
+                        help="Dónde corre el LLM: auto (default) = GPU si la "
+                             "tarjeta es potente y no está caliente, si no CPU; "
+                             "gpu = forzarla (con la protección por temperatura); "
+                             "cpu = solo CPU")
+    parser.add_argument("--ollama-gpu-index", default=OLLAMA_GPU_INDEX,
+                        help="Índice de la GPU para el LLM (main_gpu de Ollama). "
+                             "'auto' = la que elija Ollama")
+    parser.add_argument("--gpu-temp-warn", type=int, default=GPU_TEMP_WARN,
+                        help=f"Aviso de temperatura de la GPU (default: {GPU_TEMP_WARN}°C)")
+    parser.add_argument("--gpu-temp-abort", type=int, default=GPU_TEMP_ABORT,
+                        help=f"Por encima de esto la GPU descansa y el lote va a "
+                             f"CPU (default: {GPU_TEMP_ABORT}°C)")
+    parser.add_argument("--gpu-temp-resume", type=int, default=GPU_TEMP_RESUME,
+                        help=f"Temperatura a la que la GPU vuelve al trabajo tras "
+                             f"descansar (default: {GPU_TEMP_RESUME}°C)")
     parser.add_argument("--no-llm", action="store_true",
                          help="Skip Ollama analysis (transcription + frames only)")
     parser.add_argument("--split-chars", type=int, default=0,
@@ -1762,6 +2346,14 @@ def main(argv=None) -> int:
                         help="Si la URL es un directo soportado, descargar desde el "
                              "inicio de la transmisión")
     args = parser.parse_args(argv)
+
+    # Las opciones de GPU/temperatura mandan sobre el entorno.
+    OLLAMA_NUM_GPU = {"auto": "auto", "gpu": "-1", "cpu": "0"}[args.ollama_gpu]
+    if args.ollama_gpu_index is not None:
+        OLLAMA_GPU_INDEX = args.ollama_gpu_index
+    GPU_TEMP_WARN = args.gpu_temp_warn
+    GPU_TEMP_ABORT = args.gpu_temp_abort
+    GPU_TEMP_RESUME = args.gpu_temp_resume
 
     try:
         if args.transcript:
