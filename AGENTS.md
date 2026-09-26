@@ -3,10 +3,11 @@
 Esta carpeta contiene una herramienta que convierte un video en un informe
 Markdown estructurado (transcripción + ideas principales + frames).
 
-> Este es el fichero de instrucciones del agente y se llama `AGENTS.md` a
-> propósito: es el nombre que leen Codex, Cursor, Cline, Windsurf y casi todos
-> los demás. `CLAUDE.md` es solo una línea que apunta aquí, para que Claude Code
-> lo cargue sin pedir nada. **Edita `AGENTS.md`, nunca `CLAUDE.md`.**
+> Este es el único fichero de instrucciones del agente y se llama `AGENTS.md`
+> a propósito: es el nombre que leen Codex, Cursor, Cline, Windsurf y casi
+> todos los demás. No hay `CLAUDE.md`: quien use Claude Code tiene que apuntar
+> aquí (`/memory` o la regla del proyecto). Si añades instrucciones para el
+> agente, van en este archivo.
 
 ## Funciona en Linux, macOS y Windows
 
