@@ -968,29 +968,49 @@ def build_app() -> gr.Blocks:
                             label="URL (YouTube, Drive, cualquier plataforma)",
                             placeholder="https://…",
                         )
+            # Carpeta de salida con el botón DEBAJO del campo, en el mismo
+            # bloque. Gradio no deja anidar un `gr.Button` dentro del
+            # `div.block` de un campo (siempre es hermano del `div.form`), así
+            # que "mismo contenedor" se consigue metiendo campo y botón en una
+            # `gr.Column`: el CSS de `.av_carpeta` les quita el aire de en medio
+            # y hace que el botón tome el ancho del campo. Es un patrón
+            # reutilizable, por eso va en `elem_classes` y no en `elem_id`
+            # (así lo comparten las dos pestañas; la de apuntes está en
+            # `build_app`, más abajo).
             with gr.Row():
-                outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta de salida (informe + frames)")
-                outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
+                with gr.Column(elem_classes="av_carpeta", scale=2, min_width=320):
+                    outdir = gr.Textbox(value=_DEFAULT_OUTDIR,
+                                        label="Carpeta de salida (informe + frames)")
+                    outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
                 device = gr.Dropdown(["auto", "cpu", "cuda", "mps"], value="auto",
                                 label="Device")
                 model = _whisper_dropdown()
             # ── IA local (Ollama) ───────────────────────────────────────
             # Mismo patrón que el panel de origen: `variant="panel"` da el
-            # marco y `elem_id` el nombre. Cada funcionalidad va en su propia
-            # fila y, si tiene botón, el botón va en la MISMA fila que su
-            # campo (`scale=0` + `size="sm"`: el botón toma el ancho de su
-            # texto y no se luce más que el desplegable).
+            # marco y `elem_id` el nombre. Tres filas: el check, el modelo con
+            # su botón y el "dónde corre" junto al índice de GPU. Los botones
+            # van en la MISMA fila que su campo (`scale=0` + `size="sm"`: el
+            # botón toma el ancho de su texto y no se luce más que el
+            # desplegable) y el CSS de cada fila los junta en un solo bloque.
             with gr.Column(variant="panel", elem_id="av_ia"):
+                # El check va primero: es el interruptor de todo el panel.
                 with gr.Row():
+                    no_llm = gr.Checkbox(label="Omitir análisis LLM")
+                # Modelo de IA y su botón de recarga. La FILA es la unidad
+                # (campo + botón como una sola pieza) y el CSS de `#av_llm`
+                # pone el desplegable a la derecha del bloque de texto, sin
+                # que se coma el ancho del botón.
+                with gr.Row(elem_id="av_llm"):
                     llm_m = ollama_dropdown()
                     llm_refresh = gr.Button("↻ Modelos", scale=0, size="sm",
                                            min_width=96)
-                with gr.Row():
+                # Dónde corre la IA y, a su lado en la misma fila, el índice de
+                # GPU con su botón. Las dos celdas se alinean abajo: así el
+                # desplegable y su botón quedan a la altura de los botones radio.
+                with gr.Row(elem_id="av_ia_gpu"):
                     llm_use_gpu = _gpu_where_radio()
-                with gr.Row():
-                    llm_gpu_sel, llm_gpu_refresh = _gpu_index_control()
-                with gr.Row():
-                    no_llm = gr.Checkbox(label="Omitir análisis LLM")
+                    with gr.Row(elem_id="av_ia_indice", scale=0):
+                        llm_gpu_sel, llm_gpu_refresh = _gpu_index_control()
             with gr.Row():
                 interval = gr.Slider(1, 60, value=10, step=1, label="Intervalo frames (s)")
                 autoclean = gr.Dropdown(["keep", "ask", "delete"], value="keep", label="Autoclean")
@@ -1036,9 +1056,18 @@ def build_app() -> gr.Blocks:
                 with gr.Column():
                     t_path = gr.Textbox(label="…o ruta del .txt")
                     with gr.Row():
-                        t_outdir = gr.Textbox(value=_DEFAULT_OUTDIR, label="Carpeta del informe")
-                        t_outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
-                        t_llm = ollama_dropdown()
+                        # Igual que la carpeta de salida de la pestaña
+                        # "Video / URL": campo y botón en una columna con la
+                        # clase `av_carpeta`, que pone el botón DEBAJO del
+                        # campo y a su mismo ancho. `scale=1` y no `2` porque
+                        # en esta fila el sitio también lo necesitan el
+                        # desplegable de modelos y su botón.
+                        with gr.Column(elem_classes="av_carpeta", scale=2, min_width=280):
+                            t_outdir = gr.Textbox(value=_DEFAULT_OUTDIR,
+                                                  label="Carpeta del informe")
+                            t_outdir_btn = gr.Button("📂 Seleccionar Carpeta de Guardado")
+                        with gr.Column(min_width=200):
+                            t_llm = ollama_dropdown()
                         t_llm_refresh = gr.Button("↻ Modelos", scale=0, size="sm",
                                                   min_width=96)
             with gr.Row():
@@ -1251,12 +1280,116 @@ _LAYOUT_CSS = """<style>
   flex: 0 0 auto !important;
   justify-content: flex-start !important;
 }
-/* Los botones de cada campo van en la MISMA fila que su campo (no en una fila
-   aparte), pero la fila usa `align-items: flex-start` y los dejaría pegados
-   arriba, junto a la etiqueta y no al campo. `align-self: center` los pone a la
-   altura del campo. */
-#av_ia .row > button {
-  align-self: center !important;
+/* ── Campo + botón: la FILA es el bloque ─────────────────────────────────
+   Gradio no deja anidar un `gr.Button` dentro del `div.block` de un campo: el
+   botón siempre es hermano del `div.form` que envuelve al campo. Como los
+   `.block` son transparentes (el marco y el relleno los pone el panel), la
+   fila hace de contenedor único: campo y botón se leen como una sola pieza
+   siempre que la fila los alinee y no les meta aire entre medias. */
+#av_llm .form {
+  min-width: 0 !important;
+}
+/* Botón `sm` (26 px) centrado con su desplegable (40 px), que va 11 px dentro
+   del bloque: 10 de padding + 1 de borde. 11 + (40-26)/2 = 18 px. */
+#av_llm > button {
+  align-self: flex-start !important;
+  margin-top: 18px !important;
+}
+
+/* ── Modelo de IA: texto a la izquierda, desplegable a la derecha ────────
+   El `div.container` del desplegable (que lleva `span[data-testid=block-info]`,
+   `div.info-text` y `div.wrap` uno detrás de otro) se convierte en una rejilla
+   de dos columnas: la etiqueta y su texto de ayuda se apilan en la primera
+   (juntas forman el bloque de texto) y el `div.wrap` salta a la segunda
+   ocupando las dos filas. CSS no puede inventar el `div` que las envuelve a
+   las dos, pero dejarlas en la misma columna es justo lo que se busca: el
+   desplegable pegado al texto y sin comerse el ancho del botón. */
+#av_llm .container {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  align-items: start !important;
+  column-gap: .8rem !important;
+  row-gap: 0 !important;
+}
+#av_llm [data-testid="block-info"] {
+  grid-column: 1 !important;
+  grid-row: 1 !important;
+}
+#av_llm .info-text {
+  grid-column: 1 !important;
+  grid-row: 2 !important;
+  margin: 0 !important;
+}
+/* El desplegable no ocupa todo el ancho: lo que sobra es justo lo que necesita
+   el botón. Los nombres de modelo son cortos ("qwen3.5:4b"), 15rem sobra. */
+#av_llm .wrap {
+  grid-column: 2 !important;
+  grid-row: 1 / span 2 !important;
+  width: 15rem !important;
+  max-width: 100% !important;
+}
+
+/* ── "Dónde corre la IA" + índice de GPU en la misma fila ────────────────
+   Las dos celdas se alinean ABAJO: el radio es el más alto (etiqueta + texto
+   de ayuda + los tres botones) y así el desplegable del índice y su botón
+   quedan a la altura de los botones radio, no a la de las etiquetas. */
+#av_ia_gpu {
+  align-items: flex-end !important;
+}
+#av_ia_gpu > .form {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+}
+#av_ia_indice {
+  align-items: flex-end !important;
+  gap: .5rem !important;
+  /* Ancho DEFINITIVO para la celda, y no `scale=0` (que la deja en su
+     `min-width` de 160 px) ni un ajuste al contenido (que Gradio no calcula
+     bien con el `div.form` del campo dentro: el hueco sale más estrecho que el
+     campo y el botón se sale de la celda). Con 16 rem = 256 px: el botón
+     `sm` mide 78 y el hueco son 8, así que el campo se queda con 170 —24 de
+     padding del bloque— y el desplegable con 146. */
+  flex: 0 0 auto !important;
+  width: 16rem !important;
+  min-width: 0 !important;
+  flex-wrap: nowrap !important;
+}
+#av_ia_indice .form {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+}
+/* El desplegable ocupa el hueco entero: con un ancho en px aquí dentro, el
+   `div.block` (que tiene `overflow: hidden`) lo recortaba y se veía la flecha
+   partida. */
+#av_ia_indice .wrap {
+  width: 100% !important;
+}
+/* El botón, al fondo de la celda (los 10 px de padding de abajo del bloque) y
+   subido los 7 px que le faltan de alto al desplegable: mismo 18 px que en la
+   fila del modelo, pero contando desde abajo. */
+#av_ia_indice > button {
+  align-self: flex-end !important;
+  margin-bottom: 18px !important;
+}
+
+/* ── Campo de carpeta: el botón va DEBAJO, en el mismo bloque ────────────
+   Es un patrón que se repite (pestañas "Video / URL" y "Apuntes"), así que va
+   en `elem_classes` y no en `elem_id`: una sola regla para los dos. Campo y
+   botón comparten una `gr.Column` (`.av_carpeta`), sin aire entre ellos y con
+   el botón al ancho del campo, se leen como un solo bloque. */
+.av_carpeta {
+  gap: 0 !important;
+}
+.av_carpeta .form .block {
+  padding-bottom: .4rem !important;
+}
+/* El botón se alinea con el CAMPO, no con el bloque: el `div.block` mete 12 px
+   de padding a los lados y el campo (y su etiqueta) viven dentro de ellos, así
+   que el botón lleva el mismo margen lateral y queda justo debajo. */
+.av_carpeta button {
+  width: auto !important;
+  min-width: 0 !important;
+  margin: 0 12px !important;
 }
 </style>"""
 

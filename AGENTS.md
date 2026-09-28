@@ -170,9 +170,14 @@ ancho de la pestaña:
   los campos puedan encogerse en pantallas estrechas.
 - Al añadir secciones, replica el patrón: `panel` + `elem_id` + un bloque de CSS
   propio. Los `elem_id` ya usados: `av_origen`, `av_origen_campos`, `av_ia`,
-  `av_log_video`, `av_log_notes`, `av_log_live`. **Ojo**: `elem_id` va en el
-  `gr.Column` del panel, no en un `gr.Textbox`; si se pone en el campo, el id cae
-  en el `div.block` que lo envuelve, no en el `textarea`.
+  `av_llm`, `av_ia_gpu`, `av_ia_indice`, `av_log_video`, `av_log_notes`,
+  `av_log_live`. Los de panel (`av_origen`, `av_ia`) van en el `gr.Column`; los
+  de fila o columna (`av_llm`, `av_ia_gpu`, `av_ia_indice`) van en el
+  `gr.Row`/`gr.Column` que agrupa los campos. **Ojo**: en un `gr.Textbox` el
+  `elem_id` cae en el `div.block` que lo envuelve, no en el `textarea`.
+- **Un patrón que se repite en varias pestañas va en `elem_classes`, no en
+  `elem_id`**: un `elem_id` solo puede aparecer una vez. Ver "Botón debajo de su
+  campo" (`.av_carpeta`), que está en las dos pestañas de vídeo y apuntes.
 
 **`av_origen`: dos mitades iguales y texto de ayuda en la línea de la etiqueta.**
 La sección de origen es una `gr.Row` con la zona de subida a la izquierda y la
@@ -214,10 +219,91 @@ columna `av_origen_campos` a su lado (ruta local y URL):
 campo (actualizar modelos, redetectar GPUs) va en la **misma `gr.Row`** que su
 campo, no en una fila aparte. Se crea con `scale=0` (para que no reparta el
 ancho de la fila), `size="sm"` (Gradio 6 sale por defecto en `lg`, que se ve
-desproporcionado al lado de un desplegable) y un `min_width` pequeño. La fila
-usa `align-items: flex-start`, así que sin más el botón quedaría pegado arriba,
-junto a la etiqueta; `_LAYOUT_CSS` lo baja con `align-self: center` sobre
-`#av_ia .row > button`. Cada campo con botón tiene además su propia `gr.Row`.
+desproporcionado al lado de un desplegable) y un `min_width` pequeño.
+
+**La fila es el bloque: `gr.Button` no se puede anidar.** Gradio pone el botón
+como hermano del `div.form` del campo, nunca dentro de su `div.block`, así que
+"campo y botón en el mismo contenedor" se resuelve haciendo que la **fila** sea
+la unidad visual. Funciona porque los `.block` son transparentes: el marco y el
+relleno los pone el panel. Lo que sí hay que alinear es la altura, y ahí hay un
+número medido: el desplegable mide 40 px y el botón `sm` 26 px, y el campo va
+11 px dentro del bloque (10 de `padding` + 1 de borde). Por eso el botón lleva
+`margin-top: 18px` (`= 11 + (40-26)/2`) en la fila del modelo
+(`#av_llm > button`) y el equivalente por abajo, `margin-bottom: 18px`, en la
+del índice de GPU (`#av_ia_indice > button`). Si cambias el tamaño del input o
+del botón, esos 18 px hay que volver a medirlos (ver *Medir la interfaz*).
+
+**Campo con el texto a la izquierda y el desplegable a la derecha.** El campo
+"Modelo de IA local" lleva la etiqueta y su texto de ayuda a un lado, y el
+desplegable al otro, sin que el desplegable se coma el ancho del botón. Como
+un desplegable no trae los hijos dentro de un `<label>` (ver *El DOM de un
+campo*), se usa `display: grid` sobre su `div.container` con dos columnas:
+`#av_llm [data-testid="block-info"]` y `#av_llm .info-text` en la columna 1 (una
+encima de otra, que es el bloque de texto) y `#av_llm .wrap` en la columna 2
+ocupando las dos filas, con `width: 15rem` para que no se estire. CSS no puede
+crear el `div` que envuelve a etiqueta y texto, pero dejarlos en la misma
+columna da exactamente esa maqueta.
+
+**Dos campos en una misma fila, alineados abajo.** El radio "Dónde corre la IA"
+y el desplegable "GPU para la IA (índice)" comparten la fila `#av_ia_gpu`, que
+usa `align-items: flex-end`: el radio es el más alto (etiqueta + texto de ayuda +
+los tres botones) y así el desplegable del índice y su botón quedan a la altura
+de los botones radio, no a la de las etiquetas. La celda del índice es una
+`gr.Row` anidada (`#av_ia_indice`) a la que hay que darle un **ancho
+definitivo** (`width: 16rem` en el CSS), no `scale=0` ni un ajuste al contenido:
+
+- `scale=0` en una fila anidada la deja con su `min-width` de 160 px en vez de
+  al ancho de lo que contiene, y el botón se cae a la línea de abajo.
+- `width: auto` tampoco vale: Gradio no resuelve bien el ancho al contenido con
+  el `div.form` del campo dentro, la celda sale más estrecha que su contenido y
+  el botón se sale por la derecha.
+- Y **no pongas un ancho en px en el `div.wrap` del campo**: el `div.block`
+  tiene `overflow: hidden`, así que si el hueco sale más estrecho que el
+  desplegable lo recorta (se ve la flecha partida). El ancho va en la celda (o
+  en el `div.form`) y el `.wrap` a `100%`, que sí se estira a lo que queda.
+
+**Botón debajo de su campo, en el mismo bloque.** En "Carpeta de salida" y en
+"Carpeta del informe" (pestaña *Apuntes*) el botón "📂 Seleccionar" va **debajo**
+del campo, no al lado. Como tampoco se puede anidar, campo y botón se meten
+juntos en una `gr.Column` con `elem_classes="av_carpeta"` y el CSS les quita el
+aire: `gap: 0` en la columna, `padding-bottom: .4rem` en el `div.block` del
+campo y `margin: 0 12px` en el botón (los 12 px de padding lateral del bloque)
+para que el botón quede exactamente con el ancho del campo y no con el del
+bloque. Medido: 7 px entre el borde inferior del `textarea` y el del botón, y
+anchos iguales (±2 px) en las dos pestañas a 1700/1500/1200/1000/800 px.
+
+Como el patrón se repite, va en `elem_classes="av_carpeta"` y no en un
+`elem_id` (que solo puede aparecer una vez). Añadir un tercer sitio es copiar
+el `with gr.Column(elem_classes="av_carpeta", ...)` y nada más.
+
+**El DOM de un campo (Gradio 6.28).** Ojo, que **cambia según el tipo** y el CSS
+apunta a lo correcto:
+
+| | textbox / textarea | dropdown / radio |
+|---|---|---|
+| etiqueta | `<label class="container show_textbox_border">` | `div.container` (o `fieldset.block` en el radio) |
+| nombre de la etiqueta | `span[data-testid=block-info]` | el mismo `span[data-testid=block-info]` |
+| texto de ayuda | `div.info-text` | el mismo `div.info-text` |
+| control | `div.input-container > textarea` | `div.wrap > div.wrap-inner > input` |
+
+Todos cuelgan de `div.form > div.block.padded.auto-margin`, y el botón es
+hermano del `div.form` dentro del `div.row`. Por eso las reglas de
+`#av_origen_campos label` (que usan `label > span` y `label > .input-container`)
+solo afectan a los textbox, y las de `#av_llm` usan `span[data-testid=block-info]`
+y `.wrap` para el desplegable.
+
+**Medir la interfaz (no adivines el CSS).** Los números de arriba están medidos,
+no estimados, y volver a medirlos es barato: en Chromium ya instalado hay un
+`--dump-dom` para ver el DOM renderizado y, si se necesita la geometría, un
+`python -m playwright` **fuera del venv del proyecto** (con
+`pip install --target /tmp/… playwright` y `executable_path=/usr/bin/chromium`)
+da cajas y `getComputedStyle` de cada elemento. Lo que sale de ahí es lo que hay
+que mirar: si un botón se sale de su fila, si queda descentrado o si algún
+`div.block` recorta su contenido, se ve en los números, no hace falta una
+captura. Conviene pasar por varios anchos (1700, 1500, 1200, 1000, 800): lo que
+se arregla con un ancho fijo en un ancho de pantalla se rompe en otro. Y
+recuerda que **el CSS se inyecta al cargar la página**: si el usuario tiene la
+pestaña abierta desde antes del cambio, tiene que recargarla para verlo.
 
 **Checkbox alineado a la izquierda.** Gradio mete la clase `auto-margin`
 (`margin-left/right: auto`) en el contenedor de los checkbox y lo centra. Para
